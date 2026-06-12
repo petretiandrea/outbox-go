@@ -1,5 +1,10 @@
+ifeq ($(OS),Windows_NT)
 SHELL := powershell.exe
 .SHELLFLAGS := -NoProfile -Command
+else
+SHELL := /bin/sh
+.SHELLFLAGS := -c
+endif
 
 APP_NAME := outbox
 BIN_DIR := bin
@@ -13,11 +18,15 @@ OUTBOX_BATCH_SIZE ?= 100
 OUTBOX_PAYLOAD_SIZE ?= 256
 OUTBOX_POLL_INTERVAL ?= 10ms
 
-.PHONY: build test run benchmark-forwarder up down logs clean
+.PHONY: build build-linux test run benchmark-forwarder up down logs clean
 
 build:
 	if (!(Test-Path $(BIN_DIR))) { New-Item -ItemType Directory -Path $(BIN_DIR) | Out-Null }
 	go build -o $(BIN_DIR)/$(APP_NAME) $(MAIN_PACKAGE)
+
+build-linux:
+	mkdir -p $(BIN_DIR)
+	go build -trimpath -ldflags="-s -w" -o $(BIN_DIR)/$(APP_NAME) $(MAIN_PACKAGE)
 
 test:
 	go test ./...
