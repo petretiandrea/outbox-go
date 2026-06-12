@@ -19,6 +19,7 @@ jobs:
   build:
     name: Build service image
     runs-on: ubuntu-latest
+    environment: build
 
     steps:
       - name: Checkout
