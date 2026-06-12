@@ -1,8 +1,21 @@
 package main
 
-import "fmt"
+import (
+	"log"
+
+	"github.com/spf13/cobra"
+)
 
 func main() {
+	command := &cobra.Command{
+		Use:   "outbox",
+		Short: "Run the outbox forwarder service",
+	}
 
-	fmt.Println("Hello, World!")
+	command.AddCommand(newRunCommand())
+	command.AddCommand(newBenchmarkCommand())
+
+	if err := command.Execute(); err != nil {
+		log.Fatal(err)
+	}
 }

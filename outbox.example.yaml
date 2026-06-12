@@ -1,0 +1,33 @@
+source:
+  type: postgres
+  data:
+    dsn: postgres://outbox:outbox@localhost:5432/outbox?sslmode=disable
+    table_name: outbox_messages
+    batch_size: 100
+    poll_interval: 1s
+
+channels:
+  - name: orders.created
+    publisher:
+      type: rabbitmq
+      data:
+        url: amqp://guest:guest@localhost:5672/
+        exchange: outbox.events
+        routing_key: orders.created
+        content_type: application/json
+        delivery_mode: 2
+        mandatory: false
+        immediate: false
+
+  - name: payments.completed
+    publisher:
+      type: kafka
+      data:
+        brokers:
+          - localhost:9092
+        topic: payments.events
+        client_id: outbox-forwarder
+        batch_bytes: 1048576
+        batch_size: 100
+        batch_timeout: 1s
+        async: false
