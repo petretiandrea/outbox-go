@@ -28,7 +28,6 @@ type Message struct {
 	OccurredAt  time.Time
 }
 
-
 func NewMessageWithDefaults(id string, channel Channel, payload Payload) Message {
 	return Message{
 		ID:          id,
