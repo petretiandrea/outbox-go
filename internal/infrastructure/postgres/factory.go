@@ -13,10 +13,11 @@ import (
 )
 
 type FactoryConfig struct {
-	DSN          string `koanf:"dsn" yaml:"dsn" json:"dsn"`
-	TableName    string `koanf:"table_name" yaml:"table_name" json:"table_name"`
-	BatchSize    int    `koanf:"batch_size" yaml:"batch_size" json:"batch_size"`
-	PollInterval string `koanf:"poll_interval" yaml:"poll_interval" json:"poll_interval"`
+	DSN              string `koanf:"dsn" yaml:"dsn" json:"dsn"`
+	TableName        string `koanf:"table_name" yaml:"table_name" json:"table_name"`
+	BatchSize        int    `koanf:"batch_size" yaml:"batch_size" json:"batch_size"`
+	PollInterval     string `koanf:"poll_interval" yaml:"poll_interval" json:"poll_interval"`
+	InitializeSchema bool   `koanf:"initialize_schema" yaml:"initialize_schema" json:"initialize_schema"`
 }
 
 func BuildSourceFromConfig(sourceConfig config.SourceConfig) (domain.Source, error) {
@@ -37,6 +38,13 @@ func BuildSourceFromConfig(sourceConfig config.SourceConfig) (domain.Source, err
 	pool, err := pgxpool.New(context.Background(), dsn)
 	if err != nil {
 		return nil, fmt.Errorf("create postgres pool: %w", err)
+	}
+
+	if factoryConfig.InitializeSchema {
+		if err := initializeSchema(dsn, sourceConfigData.TableName); err != nil {
+			pool.Close()
+			return nil, err
+		}
 	}
 
 	source, err := NewPollerSourceFromPool(pool, sourceConfigData)

@@ -5,6 +5,7 @@ source:
     table_name: outbox_messages
     batch_size: 100
     poll_interval: 1s
+    initialize_schema: true
 
 channels:
   - name: orders.created
