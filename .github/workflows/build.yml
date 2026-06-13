@@ -4,8 +4,6 @@ on:
   push:
     branches:
       - main
-    tags:
-      - "v*"
   pull_request:
   workflow_dispatch:
 
@@ -14,13 +12,80 @@ permissions:
 
 env:
   IMAGE_NAME: ${{ secrets.DOCKERHUB_USERNAME }}/outbox-forwarder
-  TARGET_PLATFORMS: linux/arm64, linux/amd64
+  TARGET_PLATFORMS: linux/arm64,linux/amd64
 
 jobs:
-  build:
+  build-pr-image:
     name: Build service image
     runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: outbox-forwarder
+          tags: |
+            type=sha,prefix=sha-
+
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: false
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          platforms: ${{ env.TARGET_PLATFORMS }}
+
+  release-dry-run:
+    name: Resolve semantic release
+    runs-on: ubuntu-latest
     environment: build
+    if: github.event_name != 'pull_request'
+    permissions:
+      contents: read
+    outputs:
+      published: ${{ steps.semantic.outputs.new_release_published }}
+      version: ${{ steps.semantic.outputs.new_release_version }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Semantic release dry run
+        id: semantic
+        uses: cycjimmy/semantic-release-action@v4
+        with:
+          dry_run: true
+          extra_plugins: |
+            @semantic-release/commit-analyzer
+            @semantic-release/release-notes-generator
+            @semantic-release/github
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  publish-image:
+    name: Publish service image
+    runs-on: ubuntu-latest
+    needs: release-dry-run
+    environment: build
+    if: needs.release-dry-run.outputs.published == 'true'
 
     steps:
       - name: Checkout
@@ -33,7 +98,6 @@ jobs:
         uses: docker/setup-buildx-action@v3
 
       - name: Log in to Docker Hub
-        if: github.event_name != 'pull_request'
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
@@ -45,18 +109,49 @@ jobs:
         with:
           images: ${{ env.IMAGE_NAME }}
           tags: |
-            type=ref,event=branch
-            type=ref,event=tag
+            type=raw,value=v${{ needs.release-dry-run.outputs.version }}
+            type=raw,value=${{ needs.release-dry-run.outputs.version }}
+            type=raw,value=latest
             type=sha,prefix=sha-
 
-      - name: Build and optionally push
+      - name: Build and push image
         uses: docker/build-push-action@v6
         with:
           context: .
           file: ./Dockerfile
-          push: ${{ github.event_name != 'pull_request' }}
+          push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
           platforms: ${{ env.TARGET_PLATFORMS }}
+
+  release:
+    name: Create semantic release
+    runs-on: ubuntu-latest
+    needs:
+      - release-dry-run
+      - publish-image
+    environment: build
+    if: needs.release-dry-run.outputs.published == 'true'
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Semantic release
+        uses: cycjimmy/semantic-release-action@v4
+        with:
+          extra_plugins: |
+            @semantic-release/commit-analyzer
+            @semantic-release/release-notes-generator
+            @semantic-release/github
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
