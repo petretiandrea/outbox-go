@@ -1,0 +1,24 @@
+name: TruffleHog Secrets Scan
+
+on:
+    push:
+        branches: ["main"]
+    pull_request:
+    workflow_dispatch:
+
+jobs:
+    trufflehog:
+        runs-on: ubuntu-latest
+        steps:
+            - name: Checkout repository
+              uses: actions/checkout@v4
+              with:
+                  fetch-depth: 0 # IMPORTANT: serve tutta la history
+
+            - name: Run TruffleHog
+              uses: trufflesecurity/trufflehog@v3.92.3
+              with:
+                  path: .
+                  base: ""
+                  head: HEAD
+                  extra_args: --only-verified
