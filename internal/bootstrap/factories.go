@@ -5,12 +5,12 @@ import (
 	"fmt"
 	"strings"
 
-	"petretiandrea.github.com/outbox/internal/config"
-	"petretiandrea.github.com/outbox/internal/domain"
-	"petretiandrea.github.com/outbox/internal/infrastructure/kafka"
-	"petretiandrea.github.com/outbox/internal/infrastructure/postgres"
-	"petretiandrea.github.com/outbox/internal/infrastructure/rabbitmq"
-	"petretiandrea.github.com/outbox/pkg/outbox"
+	"github.com/petretiandrea/outbox-go/internal/config"
+	"github.com/petretiandrea/outbox-go/internal/domain"
+	"github.com/petretiandrea/outbox-go/internal/infrastructure/kafka"
+	"github.com/petretiandrea/outbox-go/internal/infrastructure/postgres"
+	"github.com/petretiandrea/outbox-go/internal/infrastructure/rabbitmq"
+	"github.com/petretiandrea/outbox-go/pkg/outbox"
 )
 
 type SourceBuilder func(config.SourceConfig) (domain.Source, error)

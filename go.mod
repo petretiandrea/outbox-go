@@ -1,4 +1,4 @@
-module petretiandrea.github.com/outbox
+module github.com/petretiandrea/outbox-go
 
 go 1.25.0
 
@@ -8,16 +8,14 @@ require (
 	github.com/knadh/koanf/parsers/yaml v1.1.0
 	github.com/knadh/koanf/providers/confmap v1.0.0
 	github.com/knadh/koanf/providers/env v1.1.0
-	github.com/knadh/koanf/providers/file v1.2.1
 	github.com/knadh/koanf/v2 v2.3.5
+	github.com/petretiandrea/outbox-go/pkg/outbox v0.0.0
 	github.com/rabbitmq/amqp091-go v1.11.0
 	github.com/segmentio/kafka-go v0.4.51
 	github.com/spf13/cobra v1.10.2
-	petretiandrea.github.com/outbox/pkg/outbox v0.0.0
 )
 
 require (
-	github.com/fsnotify/fsnotify v1.9.0 // indirect
 	github.com/go-viper/mapstructure/v2 v2.4.0 // indirect
 	github.com/inconshreveable/mousetrap v1.1.0 // indirect
 	github.com/jackc/pgpassfile v1.0.0 // indirect
@@ -33,8 +31,7 @@ require (
 	github.com/spf13/pflag v1.0.10 // indirect
 	go.yaml.in/yaml/v3 v3.0.4 // indirect
 	golang.org/x/sync v0.18.0 // indirect
-	golang.org/x/sys v0.38.0 // indirect
 	golang.org/x/text v0.31.0 // indirect
 )
 
-replace petretiandrea.github.com/outbox/pkg/outbox => ./pkg/outbox
+replace github.com/petretiandrea/outbox-go/pkg/outbox => ./pkg/outbox

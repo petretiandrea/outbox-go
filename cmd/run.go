@@ -7,8 +7,8 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"petretiandrea.github.com/outbox/internal/bootstrap"
-	"petretiandrea.github.com/outbox/internal/config"
+	"github.com/petretiandrea/outbox-go/internal/bootstrap"
+	"github.com/petretiandrea/outbox-go/internal/config"
 )
 
 func newRunCommand() *cobra.Command {

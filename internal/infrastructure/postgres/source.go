@@ -11,9 +11,9 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
-	"petretiandrea.github.com/outbox/internal/domain"
-	"petretiandrea.github.com/outbox/pkg/outbox"
-	outboxpg "petretiandrea.github.com/outbox/pkg/outbox/postgres"
+	"github.com/petretiandrea/outbox-go/internal/domain"
+	"github.com/petretiandrea/outbox-go/pkg/outbox"
+	outboxpg "github.com/petretiandrea/outbox-go/pkg/outbox/postgres"
 )
 
 const (

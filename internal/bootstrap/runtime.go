@@ -4,8 +4,8 @@ import (
 	"context"
 	"errors"
 
-	"petretiandrea.github.com/outbox/internal/config"
-	"petretiandrea.github.com/outbox/internal/domain"
+	"github.com/petretiandrea/outbox-go/internal/config"
+	"github.com/petretiandrea/outbox-go/internal/domain"
 )
 
 type Runtime struct {

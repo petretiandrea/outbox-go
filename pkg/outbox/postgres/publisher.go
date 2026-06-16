@@ -10,7 +10,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
-	"petretiandrea.github.com/outbox/pkg/outbox"
+	"github.com/petretiandrea/outbox-go/pkg/outbox"
 )
 
 const defaultTableName = "outbox_messages"

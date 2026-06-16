@@ -10,8 +10,8 @@ import (
 	"sync"
 	"time"
 
-	"petretiandrea.github.com/outbox/internal/domain"
-	"petretiandrea.github.com/outbox/pkg/outbox"
+	"github.com/petretiandrea/outbox-go/internal/domain"
+	"github.com/petretiandrea/outbox-go/pkg/outbox"
 )
 
 type Config struct {

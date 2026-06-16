@@ -8,7 +8,7 @@ import (
 
 	kafkago "github.com/segmentio/kafka-go"
 
-	"petretiandrea.github.com/outbox/pkg/outbox"
+	"github.com/petretiandrea/outbox-go/pkg/outbox"
 )
 
 type PublisherConfig struct {

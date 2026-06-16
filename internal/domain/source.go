@@ -3,7 +3,7 @@ package domain
 import (
 	"context"
 
-	"petretiandrea.github.com/outbox/pkg/outbox"
+	"github.com/petretiandrea/outbox-go/pkg/outbox"
 )
 
 // Source represents a message source that can stream outbox messages to a handler.

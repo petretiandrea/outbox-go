@@ -4,8 +4,8 @@ import (
 	"errors"
 	"time"
 
-	"petretiandrea.github.com/outbox/internal/config"
-	"petretiandrea.github.com/outbox/pkg/outbox"
+	"github.com/petretiandrea/outbox-go/internal/config"
+	"github.com/petretiandrea/outbox-go/pkg/outbox"
 )
 
 type FactoryConfig struct {

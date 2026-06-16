@@ -9,10 +9,10 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/spf13/cobra"
 
-	"petretiandrea.github.com/outbox/internal/benchmark"
-	"petretiandrea.github.com/outbox/internal/infrastructure/postgres"
-	"petretiandrea.github.com/outbox/pkg/outbox"
-	outboxpostgres "petretiandrea.github.com/outbox/pkg/outbox/postgres"
+	"github.com/petretiandrea/outbox-go/internal/benchmark"
+	"github.com/petretiandrea/outbox-go/internal/infrastructure/postgres"
+	"github.com/petretiandrea/outbox-go/pkg/outbox"
+	outboxpostgres "github.com/petretiandrea/outbox-go/pkg/outbox/postgres"
 )
 
 func newPostgresBenchmarkCommand() *cobra.Command {

@@ -8,8 +8,8 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
-	"petretiandrea.github.com/outbox/internal/config"
-	"petretiandrea.github.com/outbox/internal/domain"
+	"github.com/petretiandrea/outbox-go/internal/config"
+	"github.com/petretiandrea/outbox-go/internal/domain"
 )
 
 type FactoryConfig struct {

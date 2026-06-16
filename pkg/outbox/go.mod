@@ -1,4 +1,4 @@
-module petretiandrea.github.com/outbox/pkg/outbox
+module github.com/petretiandrea/outbox-go/pkg/outbox
 
 go 1.25.0
 

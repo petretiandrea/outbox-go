@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"strings"
 
-	"petretiandrea.github.com/outbox/pkg/outbox"
+	"github.com/petretiandrea/outbox-go/pkg/outbox"
 )
 
 type OutboxProcessorConfig struct {
