@@ -16,6 +16,8 @@ import (
 //go:embed migrations/*.sql
 var migrationFiles embed.FS
 
+const migrationTableName = "outbox_schema_migrations"
+
 func initializeSchema(dsn string, tableName string) error {
 	if normalizedTableName(tableName) != defaultTableName {
 		return fmt.Errorf("initialize_schema only supports table_name %q", defaultTableName)
@@ -33,7 +35,9 @@ func initializeSchema(dsn string, tableName string) error {
 	}
 	defer sourceDriver.Close()
 
-	databaseDriver, err := migratepostgres.WithInstance(db, &migratepostgres.Config{})
+	databaseDriver, err := migratepostgres.WithInstance(db, &migratepostgres.Config{
+		MigrationsTable: migrationTableName,
+	})
 	if err != nil {
 		return fmt.Errorf("create postgres migration database: %w", err)
 	}
