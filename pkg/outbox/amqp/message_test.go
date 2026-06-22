@@ -55,7 +55,6 @@ func TestMessageFromDeliveryMapsAMQPToMessage(t *testing.T) {
 		Headers: amqp091.Table{
 			AffinityKeyHeader: "customer-456",
 			"source":          "checkout",
-			"ignored":         int32(10),
 		},
 		Body:      []byte(`{"order_id":"order-123"}`),
 		MessageId: "order-123",
@@ -63,7 +62,10 @@ func TestMessageFromDeliveryMapsAMQPToMessage(t *testing.T) {
 		Type:      "orders.created",
 	}
 
-	message := MessageFromDelivery(delivery)
+	message, err := MessageFromDelivery(delivery)
+	if err != nil {
+		t.Fatalf("MessageFromDelivery returned error: %v", err)
+	}
 
 	if message.ID != delivery.MessageId {
 		t.Fatalf("expected message id %q, got %q", delivery.MessageId, message.ID)
@@ -80,7 +82,31 @@ func TestMessageFromDeliveryMapsAMQPToMessage(t *testing.T) {
 	if _, ok := message.Metadata[AffinityKeyHeader]; ok {
 		t.Fatalf("affinity key header should not be copied into metadata")
 	}
-	if _, ok := message.Metadata["ignored"]; ok {
-		t.Fatalf("non-string header should not be copied into metadata")
+}
+
+func TestMessageFromDeliveryReturnsErrorForInvalidMessage(t *testing.T) {
+	delivery := amqp091.Delivery{
+		Body: []byte(`{"order_id":"order-123"}`),
+		Type: "orders.created",
+	}
+
+	if _, err := MessageFromDelivery(delivery); err == nil {
+		t.Fatal("expected invalid message error")
+	}
+}
+
+func TestMessageFromDeliveryReturnsErrorForUnsupportedHeader(t *testing.T) {
+	delivery := amqp091.Delivery{
+		Headers: amqp091.Table{
+			"attempt": int32(10),
+		},
+		Body:      []byte(`{"order_id":"order-123"}`),
+		MessageId: "order-123",
+		Timestamp: time.Date(2026, 6, 22, 10, 30, 0, 0, time.UTC),
+		Type:      "orders.created",
+	}
+
+	if _, err := MessageFromDelivery(delivery); err == nil {
+		t.Fatal("expected unsupported header error")
 	}
 }

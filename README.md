@@ -163,7 +163,10 @@ import (
 )
 
 func handleDelivery(delivery amqp.Delivery) error {
-	msg := outboxamqp.MessageFromDelivery(delivery)
+	msg, err := outboxamqp.MessageFromDelivery(delivery)
+	if err != nil {
+		return err
+	}
 
 	// msg.Payload is the application event body.
 	// msg.Metadata contains string metadata headers.

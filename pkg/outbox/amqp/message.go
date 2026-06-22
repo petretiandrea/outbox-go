@@ -1,6 +1,7 @@
 package amqp
 
 import (
+	"fmt"
 	"strings"
 
 	amqp091 "github.com/rabbitmq/amqp091-go"
@@ -68,10 +69,13 @@ func HeadersFromMetadata(metadata outbox.Metadata) amqp091.Table {
 }
 
 // MessageFromDelivery converts a consumed AMQP delivery back to an outbox.Message.
-func MessageFromDelivery(delivery amqp091.Delivery) outbox.Message {
-	metadata, affinityKey := metadataAndAffinityKey(delivery.Headers)
+func MessageFromDelivery(delivery amqp091.Delivery) (outbox.Message, error) {
+	metadata, affinityKey, err := metadataAndAffinityKey(delivery.Headers)
+	if err != nil {
+		return outbox.Message{}, err
+	}
 
-	return outbox.Message{
+	message := outbox.Message{
 		ID:          delivery.MessageId,
 		Channel:     outbox.Channel(delivery.Type),
 		AffinityKey: affinityKey,
@@ -79,13 +83,22 @@ func MessageFromDelivery(delivery amqp091.Delivery) outbox.Message {
 		Metadata:    metadata,
 		OccurredAt:  delivery.Timestamp,
 	}
+
+	if err := message.Validate(); err != nil {
+		return outbox.Message{}, err
+	}
+
+	return message, nil
 }
 
 // MessageFromPublishing converts AMQP publishing properties back to an outbox.Message.
-func MessageFromPublishing(publishing amqp091.Publishing) outbox.Message {
-	metadata, affinityKey := metadataAndAffinityKey(publishing.Headers)
+func MessageFromPublishing(publishing amqp091.Publishing) (outbox.Message, error) {
+	metadata, affinityKey, err := metadataAndAffinityKey(publishing.Headers)
+	if err != nil {
+		return outbox.Message{}, err
+	}
 
-	return outbox.Message{
+	message := outbox.Message{
 		ID:          publishing.MessageId,
 		Channel:     outbox.Channel(publishing.Type),
 		AffinityKey: affinityKey,
@@ -93,11 +106,17 @@ func MessageFromPublishing(publishing amqp091.Publishing) outbox.Message {
 		Metadata:    metadata,
 		OccurredAt:  publishing.Timestamp,
 	}
+
+	if err := message.Validate(); err != nil {
+		return outbox.Message{}, err
+	}
+
+	return message, nil
 }
 
-func metadataAndAffinityKey(headers amqp091.Table) (outbox.Metadata, outbox.AffinityKey) {
+func metadataAndAffinityKey(headers amqp091.Table) (outbox.Metadata, outbox.AffinityKey, error) {
 	if len(headers) == 0 {
-		return nil, ""
+		return nil, "", nil
 	}
 
 	metadata := make(outbox.Metadata, len(headers))
@@ -106,7 +125,7 @@ func metadataAndAffinityKey(headers amqp091.Table) (outbox.Metadata, outbox.Affi
 	for key, value := range headers {
 		headerValue, ok := headerString(value)
 		if !ok {
-			continue
+			return nil, "", fmt.Errorf("amqp header %q must be a string or []byte", key)
 		}
 		if key == AffinityKeyHeader {
 			affinityKey = outbox.AffinityKey(headerValue)
@@ -119,7 +138,7 @@ func metadataAndAffinityKey(headers amqp091.Table) (outbox.Metadata, outbox.Affi
 		metadata = nil
 	}
 
-	return metadata, affinityKey
+	return metadata, affinityKey, nil
 }
 
 func headerString(value any) (string, bool) {
