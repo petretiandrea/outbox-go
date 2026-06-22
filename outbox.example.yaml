@@ -5,6 +5,7 @@ source:
     table_name: outbox_messages
     batch_size: 100
     poll_interval: 1s
+    claim_lease: 30s
     initialize_schema: true
 
 channels:

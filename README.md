@@ -94,6 +94,7 @@ source:
     table_name: outbox_messages
     batch_size: 100
     poll_interval: 1s
+    claim_lease: 30s
     initialize_schema: true
 ```
 
@@ -105,11 +106,15 @@ Fields:
 | `table_name` | no | Outbox table name. Default is `outbox_messages`. |
 | `batch_size` | no | Max messages fetched per poll. Default is `100`. |
 | `poll_interval` | no | Delay when no messages are found. Default is `1s`. |
+| `claim_lease` | no | How long a forwarder owns a claimed batch before another forwarder can retry it. Default is `30s`. |
+| `claim_owner` | no | Identifier stored in claimed rows. Default is generated from hostname and process id. |
 | `initialize_schema` | no | If `true`, runs embedded PostgreSQL migrations during startup before subscribing. Default is `false`. |
 
 `initialize_schema` is executed before the first subscribe loop. If schema initialization fails, the service fails fast and does not start processing.
 
 Current schema initialization supports the default table name `outbox_messages`.
+
+The PostgreSQL source claims rows before publishing and deletes them only after the publish succeeds. If publishing fails, the claim is released and the row can be retried. If the process crashes after publishing but before delete, the message can be published again after the claim lease expires, so consumers should treat delivery as at-least-once and use `Message.ID` for idempotency.
 
 ## RabbitMQ Publisher
 
@@ -214,6 +219,7 @@ source:
     table_name: outbox_messages
     batch_size: 100
     poll_interval: 1s
+    claim_lease: 30s
     initialize_schema: true
 
 channels:
@@ -255,6 +261,7 @@ OUTBOX_SOURCE__DATA__DSN=postgres://outbox:outbox@postgres:5432/outbox?sslmode=d
 OUTBOX_SOURCE__DATA__TABLE_NAME=outbox_messages
 OUTBOX_SOURCE__DATA__BATCH_SIZE=100
 OUTBOX_SOURCE__DATA__POLL_INTERVAL=1s
+OUTBOX_SOURCE__DATA__CLAIM_LEASE=30s
 OUTBOX_SOURCE__DATA__INITIALIZE_SCHEMA=true
 ```
 
@@ -298,6 +305,7 @@ Run with env only:
 OUTBOX_SOURCE__TYPE=postgres \
 OUTBOX_SOURCE__DATA__DSN='postgres://outbox:outbox@localhost:5432/outbox?sslmode=disable' \
 OUTBOX_SOURCE__DATA__INITIALIZE_SCHEMA=true \
+OUTBOX_SOURCE__DATA__CLAIM_LEASE=30s \
 OUTBOX_CHANNELS__0__NAME=orders.created \
 OUTBOX_CHANNELS__0__PUBLISHER__TYPE=rabbitmq \
 OUTBOX_CHANNELS__0__PUBLISHER__DATA__URL='amqp://guest:guest@localhost:5672/' \
@@ -311,6 +319,7 @@ On Windows PowerShell:
 $env:OUTBOX_SOURCE__TYPE = "postgres"
 $env:OUTBOX_SOURCE__DATA__DSN = "postgres://outbox:outbox@localhost:5432/outbox?sslmode=disable"
 $env:OUTBOX_SOURCE__DATA__INITIALIZE_SCHEMA = "true"
+$env:OUTBOX_SOURCE__DATA__CLAIM_LEASE = "30s"
 $env:OUTBOX_CHANNELS__0__NAME = "orders.created"
 $env:OUTBOX_CHANNELS__0__PUBLISHER__TYPE = "rabbitmq"
 $env:OUTBOX_CHANNELS__0__PUBLISHER__DATA__URL = "amqp://guest:guest@localhost:5672/"
@@ -360,6 +369,7 @@ data:
         table_name: outbox_messages
         batch_size: 100
         poll_interval: 1s
+        claim_lease: 30s
         initialize_schema: true
 
     channels:
@@ -437,6 +447,9 @@ Only add `args` if you mount the config somewhere else.
 ## Operational Notes
 
 - Start with `replicas: 1`.
+- The forwarder uses at-least-once delivery. Consumers should be idempotent by `Message.ID`.
+- Multiple replicas can share the same table because rows are claimed with a lease before publishing.
+- Set `claim_lease` longer than the expected maximum publish time. If the process crashes, another replica can retry after the lease expires.
 - `initialize_schema: true` is useful for development and simple deployments.
 - In stricter production environments, you may prefer to run migrations outside the service and set `initialize_schema: false`.
 - The forwarder fails startup if the source or publishers cannot be created.
@@ -459,7 +472,7 @@ Publisher type must be `rabbitmq`, `rabbit`, or `kafka`.
 
 `initialize_schema only supports table_name "outbox_messages"`
 
-Embedded migrations currently create the default table. Use `table_name: outbox_messages` or disable `initialize_schema` and manage custom schema yourself.
+Embedded migrations currently create the default table. Use `table_name: outbox_messages` or disable `initialize_schema` and manage custom schema yourself. Custom tables must include the claim columns `claimed_by`, `claimed_until`, `attempts`, and `last_error`.
 
 No messages are published.
 

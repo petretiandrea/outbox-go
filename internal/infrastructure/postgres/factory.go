@@ -17,6 +17,8 @@ type FactoryConfig struct {
 	TableName        string `koanf:"table_name" yaml:"table_name" json:"table_name"`
 	BatchSize        int    `koanf:"batch_size" yaml:"batch_size" json:"batch_size"`
 	PollInterval     string `koanf:"poll_interval" yaml:"poll_interval" json:"poll_interval"`
+	ClaimLease       string `koanf:"claim_lease" yaml:"claim_lease" json:"claim_lease"`
+	ClaimOwner       string `koanf:"claim_owner" yaml:"claim_owner" json:"claim_owner"`
 	InitializeSchema bool   `koanf:"initialize_schema" yaml:"initialize_schema" json:"initialize_schema"`
 }
 
@@ -70,9 +72,20 @@ func (c FactoryConfig) toSourceConfig() (SourceConfig, string, error) {
 		pollInterval = parsed
 	}
 
+	claimLease := time.Duration(0)
+	if c.ClaimLease != "" {
+		parsed, err := time.ParseDuration(c.ClaimLease)
+		if err != nil {
+			return SourceConfig{}, "", err
+		}
+		claimLease = parsed
+	}
+
 	return SourceConfig{
 		TableName:    c.TableName,
 		BatchSize:    c.BatchSize,
 		PollInterval: pollInterval,
+		ClaimLease:   claimLease,
+		ClaimOwner:   c.ClaimOwner,
 	}, c.DSN, nil
 }
