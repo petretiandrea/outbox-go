@@ -140,6 +140,37 @@ Fields:
 | `mandatory` | no | AMQP mandatory flag. |
 | `immediate` | no | AMQP immediate flag. |
 
+### RabbitMQ Consumer Schema
+
+RabbitMQ messages are published as AMQP properties plus the original payload body:
+
+| AMQP field | Outbox field |
+| --- | --- |
+| `Body` | `Message.Payload` |
+| `MessageId` | `Message.ID` |
+| `CorrelationId` | `Message.ID` |
+| `Type` | `Message.Channel` |
+| `Timestamp` | `Message.OccurredAt` |
+| `Headers` | `Message.Metadata` |
+| `Headers["affinity_key"]` | `Message.AffinityKey` |
+
+Consumers can use the public AMQP helpers to decode deliveries:
+
+```go
+import (
+	outboxamqp "github.com/petretiandrea/outbox-go/pkg/outbox/amqp"
+	amqp "github.com/rabbitmq/amqp091-go"
+)
+
+func handleDelivery(delivery amqp.Delivery) error {
+	msg := outboxamqp.MessageFromDelivery(delivery)
+
+	// msg.Payload is the application event body.
+	// msg.Metadata contains string metadata headers.
+	return process(msg)
+}
+```
+
 ## Kafka Publisher
 
 ```yaml

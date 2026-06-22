@@ -9,9 +9,8 @@ import (
 	amqp "github.com/rabbitmq/amqp091-go"
 
 	"github.com/petretiandrea/outbox-go/pkg/outbox"
+	outboxamqp "github.com/petretiandrea/outbox-go/pkg/outbox/amqp"
 )
-
-const persistentDeliveryMode = 2
 
 type PublisherConfig struct {
 	URL          string
@@ -61,7 +60,7 @@ func NewPublisher(config PublisherConfig) (*Publisher, error) {
 
 	deliveryMode := config.DeliveryMode
 	if deliveryMode == 0 {
-		deliveryMode = persistentDeliveryMode
+		deliveryMode = outboxamqp.PersistentDeliveryMode
 	}
 
 	return &Publisher{
@@ -85,28 +84,12 @@ func (p *Publisher) Publish(ctx context.Context, messages ...outbox.Message) err
 	defer p.mu.Unlock()
 
 	for _, message := range messages {
-		if err := message.Validate(); err != nil {
+		publishing, err := outboxamqp.NewPublishing(message, outboxamqp.PublishingConfig{
+			ContentType:  p.contentType,
+			DeliveryMode: p.deliveryMode,
+		})
+		if err != nil {
 			return err
-		}
-
-		headers := amqp.Table{}
-		for key, value := range message.Metadata {
-			headers[key] = value
-		}
-
-		publishing := amqp.Publishing{
-			Headers:       headers,
-			ContentType:   p.contentType,
-			Body:          []byte(message.Payload),
-			MessageId:     message.ID,
-			Timestamp:     message.OccurredAt,
-			DeliveryMode:  p.deliveryMode,
-			CorrelationId: message.ID,
-			Type:          string(message.Channel),
-		}
-
-		if message.AffinityKey != "" {
-			publishing.Headers["affinity_key"] = string(message.AffinityKey)
 		}
 
 		if err := p.channel.PublishWithContext(
