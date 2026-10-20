@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math/rand/v2"
 	"os"
 	"strconv"
 	"strings"
@@ -20,11 +21,31 @@ import (
 )
 
 const (
+	publishRetryBase    = 100 * time.Millisecond
+	publishRetryCap     = 5 * time.Second
 	defaultTableName    = "outbox_messages"
 	defaultBatchSize    = 100
 	defaultPollInterval = time.Second
 	defaultClaimLease   = 30 * time.Second
 )
+
+// publishBackoff uses equal jitter: each delay is between half and all of
+// the exponentially growing limit, so even a prolonged outage has a minimum wait.
+type publishBackoff struct {
+	limit time.Duration
+}
+
+func (b *publishBackoff) next(randomN func(int64) int64) time.Duration {
+	if b.limit == 0 {
+		b.limit = publishRetryBase
+	} else {
+		b.limit = min(2*b.limit, publishRetryCap)
+	}
+	half := b.limit / 2
+	return half + time.Duration(randomN(int64(b.limit-half)+1))
+}
+
+func (b *publishBackoff) reset() { b.limit = 0 }
 
 type queryExecutor interface {
 	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
@@ -113,6 +134,7 @@ func (s *PollerSource) Subscribe(ctx context.Context, handler func(...*outbox.Me
 		return errors.New("handler is required")
 	}
 
+	var backoff publishBackoff
 	for {
 		select {
 		case <-ctx.Done():
@@ -145,9 +167,21 @@ func (s *PollerSource) Subscribe(ctx context.Context, handler func(...*outbox.Me
 			if releaseErr := s.releaseMessages(ctx, messages, err); releaseErr != nil {
 				return errors.Join(err, releaseErr)
 			}
-			return err
+			var publishErr *domain.PublishError
+			if !errors.As(err, &publishErr) || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				return err
+			}
+			timer := time.NewTimer(backoff.next(rand.Int64N))
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return ctx.Err()
+			case <-timer.C:
+			}
+			continue
 		}
 
+		backoff.reset()
 		if err := s.deleteMessages(ctx, messages); err != nil {
 			return err
 		}

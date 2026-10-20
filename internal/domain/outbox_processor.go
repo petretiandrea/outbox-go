@@ -9,6 +9,18 @@ import (
 	"github.com/petretiandrea/outbox-go/pkg/outbox"
 )
 
+// PublishError identifies a failed publisher call that the source may retry.
+type PublishError struct {
+	Channel outbox.Channel
+	Err     error
+}
+
+func (e *PublishError) Error() string {
+	return fmt.Sprintf("publish batch for channel %q: %v", e.Channel, e.Err)
+}
+
+func (e *PublishError) Unwrap() error { return e.Err }
+
 type OutboxProcessorConfig struct {
 	Source     Source
 	Publishers map[outbox.Channel]outbox.Publisher
@@ -88,7 +100,7 @@ func (p *OutboxProcessor) handleMessages(ctx context.Context, messages ...*outbo
 	for channel, batch := range grouped {
 		publisher := p.publishers[channel]
 		if err := publisher.Publish(ctx, batch...); err != nil {
-			return fmt.Errorf("publish batch for channel %q: %w", channel, err)
+			return &PublishError{Channel: channel, Err: err}
 		}
 	}
 
