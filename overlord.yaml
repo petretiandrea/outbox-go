@@ -1,0 +1,11 @@
+version: 1
+environment:
+  type: devcontainer
+  config: .devcontainer/devcontainer.json
+agent:
+  type: codex
+checks:
+  - go test ./...
+limits:
+  timeoutMinutes: 30
+  retainWorkspaceHours: 24

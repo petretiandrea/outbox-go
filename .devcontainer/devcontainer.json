@@ -1,0 +1,6 @@
+{
+  "name": "outbox-go-overlord",
+  "build": {
+    "dockerfile": "Dockerfile"
+  }
+}
