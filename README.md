@@ -327,6 +327,16 @@ $env:OUTBOX_CHANNELS__0__PUBLISHER__DATA__ROUTING_KEY = "orders.created"
 go run ./cmd run
 ```
 
+## Development with Overlord
+
+`overlord.yaml` selects `.devcontainer/devcontainer.json` as the development environment. Codex CLI runs inside the Dev Container.
+
+Run the final check with:
+
+```bash
+go test ./...
+```
+
 ## Running With Docker
 
 The image default command is:
