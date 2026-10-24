@@ -129,7 +129,6 @@ channels:
         routing_key: orders.created
         content_type: application/json
         delivery_mode: 2
-        mandatory: false
         immediate: false
 ```
 
@@ -141,9 +140,17 @@ Fields:
 | `exchange` | no | Exchange name. Empty string publishes to the default exchange. |
 | `routing_key` | yes | Routing key used for publish. |
 | `content_type` | no | Message content type. Default is `application/octet-stream`. |
-| `delivery_mode` | no | AMQP delivery mode. Default is `2` for persistent. |
-| `mandatory` | no | AMQP mandatory flag. |
+| `delivery_mode` | no | Must be `2` (persistent); this is also the default. |
+| `mandatory` | no | Deprecated and ignored. Publishing is always mandatory so unroutable messages are returned and the outbox row is retained. |
 | `immediate` | no | AMQP immediate flag. |
+
+The publisher enables RabbitMQ publisher confirms and waits for a broker ACK for
+each message. It uses mandatory routing and persistent delivery. A broker NACK,
+connection/channel failure, timeout, or returned (unroutable) publication fails
+the batch, so the PostgreSQL source retains the claimed rows. Configure durable
+exchanges and queues/bindings where the broker must preserve messages across a
+restart. Delivery remains at-least-once: a process failure after a broker ACK and
+before the source deletes the row can cause a duplicate publication.
 
 ### RabbitMQ Consumer Schema
 
