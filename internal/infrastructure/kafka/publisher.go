@@ -18,7 +18,8 @@ type PublisherConfig struct {
 	BatchBytes   int
 	BatchSize    int
 	BatchTimeout time.Duration
-	Async        bool
+	// Async is retained for config compatibility; true is rejected to prevent message loss.
+	Async bool
 }
 
 type Publisher struct {
@@ -33,10 +34,15 @@ func NewPublisher(config PublisherConfig) (*Publisher, error) {
 		return nil, errors.New("kafka publisher requires a topic")
 	}
 
+	if config.Async {
+		return nil, errors.New("kafka publisher requires synchronous delivery; async must be false")
+	}
+
 	writer := &kafkago.Writer{
 		Addr:         kafkago.TCP(config.Brokers...),
 		Topic:        config.Topic,
-		Async:        config.Async,
+		RequiredAcks: kafkago.RequireAll,
+		Balancer:     &kafkago.Hash{},
 		BatchBytes:   int64(config.BatchBytes),
 		BatchSize:    config.BatchSize,
 		BatchTimeout: config.BatchTimeout,

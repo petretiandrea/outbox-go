@@ -207,7 +207,9 @@ Fields:
 | `batch_bytes` | no | Kafka writer batch byte limit. |
 | `batch_size` | no | Kafka writer batch size. |
 | `batch_timeout` | no | Kafka writer batch timeout, for example `1s`. |
-| `async` | no | If `true`, Kafka writer publishes asynchronously. |
+| `async` | no | Must be `false` (the default). Asynchronous delivery is rejected because outbox rows may only be deleted after Kafka acknowledges delivery. |
+
+Kafka publishing waits for all in-sync replicas to acknowledge each batch. Messages use a hash of `Message.AffinityKey` to select a partition, so the same key maps to the same partition while the partition count stays unchanged. This does not guarantee ordering across concurrent forwarders or retries.
 
 ## Complete YAML Example
 
