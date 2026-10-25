@@ -18,7 +18,7 @@ OUTBOX_BATCH_SIZE ?= 100
 OUTBOX_PAYLOAD_SIZE ?= 256
 OUTBOX_POLL_INTERVAL ?= 10ms
 
-.PHONY: build build-linux test run benchmark-forwarder up down logs clean
+.PHONY: build build-linux generate test run benchmark-forwarder up down logs clean
 
 build:
 	if (!(Test-Path $(BIN_DIR))) { New-Item -ItemType Directory -Path $(BIN_DIR) | Out-Null }
@@ -27,6 +27,9 @@ build:
 build-linux:
 	mkdir -p $(BIN_DIR)
 	go build -trimpath -ldflags="-s -w" -o $(BIN_DIR)/$(APP_NAME) $(MAIN_PACKAGE)
+
+generate:
+	sqlc generate
 
 test:
 	go test ./...

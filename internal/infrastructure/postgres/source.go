@@ -5,18 +5,18 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"strconv"
 	"strings"
 	"time"
 
-	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/petretiandrea/outbox-go/internal/domain"
+	postgresqlc "github.com/petretiandrea/outbox-go/internal/infrastructure/postgres/sqlc"
 	"github.com/petretiandrea/outbox-go/pkg/outbox"
-	outboxpg "github.com/petretiandrea/outbox-go/pkg/outbox/postgres"
 )
 
 const (
@@ -25,11 +25,6 @@ const (
 	defaultPollInterval = time.Second
 	defaultClaimLease   = 30 * time.Second
 )
-
-type queryExecutor interface {
-	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
-	Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
-}
 
 type SourceConfig struct {
 	TableName    string
@@ -40,8 +35,7 @@ type SourceConfig struct {
 }
 
 type PollerSource struct {
-	db           queryExecutor
-	tableName    string
+	queries      *postgresqlc.Queries
 	batchSize    int
 	pollInterval time.Duration
 	claimLease   time.Duration
@@ -49,7 +43,7 @@ type PollerSource struct {
 	closeFn      func() error
 }
 
-func NewPollerSource(db queryExecutor, config SourceConfig) (*PollerSource, error) {
+func NewPollerSource(db postgresqlc.DBTX, config SourceConfig) (*PollerSource, error) {
 	if db == nil {
 		return nil, errors.New("postgres source requires a query executor")
 	}
@@ -58,10 +52,16 @@ func NewPollerSource(db queryExecutor, config SourceConfig) (*PollerSource, erro
 	if tableName == "" {
 		tableName = defaultTableName
 	}
+	if tableName != defaultTableName {
+		return nil, fmt.Errorf("postgres source only supports table_name %q", defaultTableName)
+	}
 
 	batchSize := config.BatchSize
 	if batchSize <= 0 {
 		batchSize = defaultBatchSize
+	}
+	if batchSize > math.MaxInt32 {
+		return nil, fmt.Errorf("postgres source batch size must not exceed %d", math.MaxInt32)
 	}
 
 	pollInterval := config.PollInterval
@@ -80,8 +80,7 @@ func NewPollerSource(db queryExecutor, config SourceConfig) (*PollerSource, erro
 	}
 
 	return &PollerSource{
-		db:           db,
-		tableName:    tableName,
+		queries:      postgresqlc.New(db),
 		batchSize:    batchSize,
 		pollInterval: pollInterval,
 		claimLease:   claimLease,
@@ -159,53 +158,23 @@ func (s *PollerSource) Close() error {
 }
 
 func (s *PollerSource) claimBatch(ctx context.Context) ([]outbox.Message, error) {
-	query := fmt.Sprintf(`
-WITH candidate AS (
-    SELECT id
-    FROM %s
-    WHERE claimed_until IS NULL OR claimed_until <= now()
-    ORDER BY occurred_at ASC, id ASC
-    LIMIT $1
-    FOR UPDATE SKIP LOCKED
-),
-claimed AS (
-    UPDATE %s AS outbox
-    SET claimed_by = $2,
-        claimed_until = now() + ($3 * interval '1 millisecond'),
-        attempts = attempts + 1,
-        last_error = NULL
-    FROM candidate
-    WHERE outbox.id = candidate.id
-    RETURNING outbox.id, outbox.channel, outbox.affinity_key, outbox.payload, outbox.metadata, outbox.occurred_at
-)
-SELECT id, channel, affinity_key, payload, metadata, occurred_at
-FROM claimed
-ORDER BY occurred_at ASC, id ASC
-`, s.tableName, s.tableName)
-
-	rows, err := s.db.Query(ctx, query, s.batchSize, s.claimOwner, s.claimLease.Milliseconds())
+	records, err := s.queries.ClaimOutboxMessages(ctx, postgresqlc.ClaimOutboxMessagesParams{
+		BatchSize:              int32(s.batchSize),
+		ClaimedBy:              requiredText(s.claimOwner),
+		ClaimLeaseMilliseconds: s.claimLease.Milliseconds(),
+	})
 	if err != nil {
 		return nil, fmt.Errorf("claim outbox messages: %w", err)
 	}
-	defer rows.Close()
 
-	messages := make([]outbox.Message, 0, s.batchSize)
-	for rows.Next() {
-		record, err := scanPostgresMessage(rows)
-		if err != nil {
-			return nil, err
-		}
-
+	messages := make([]outbox.Message, 0, len(records))
+	for _, record := range records {
 		message, err := toMessage(record)
 		if err != nil {
 			return nil, err
 		}
 
 		messages = append(messages, message)
-	}
-
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("iterate claimed outbox messages: %w", err)
 	}
 
 	return messages, nil
@@ -216,17 +185,15 @@ func (s *PollerSource) deleteMessages(ctx context.Context, messages []outbox.Mes
 		return nil
 	}
 
-	query := fmt.Sprintf(`
-DELETE FROM %s
-WHERE claimed_by = $1 AND id = ANY($2)
-`, s.tableName)
-
-	commandTag, err := s.db.Exec(ctx, query, s.claimOwner, messageIDs(messages))
+	deleted, err := s.queries.DeleteClaimedOutboxMessages(ctx, postgresqlc.DeleteClaimedOutboxMessagesParams{
+		ClaimedBy: requiredText(s.claimOwner),
+		Ids:       messageIDs(messages),
+	})
 	if err != nil {
 		return fmt.Errorf("delete processed outbox messages: %w", err)
 	}
-	if commandTag.RowsAffected() != int64(len(messages)) {
-		return fmt.Errorf("delete processed outbox messages: deleted %d of %d claimed messages", commandTag.RowsAffected(), len(messages))
+	if deleted != int64(len(messages)) {
+		return fmt.Errorf("delete processed outbox messages: deleted %d of %d claimed messages", deleted, len(messages))
 	}
 
 	return nil
@@ -237,38 +204,18 @@ func (s *PollerSource) releaseMessages(ctx context.Context, messages []outbox.Me
 		return nil
 	}
 
-	query := fmt.Sprintf(`
-UPDATE %s
-SET claimed_by = NULL,
-    claimed_until = NULL,
-    last_error = $3
-WHERE claimed_by = $1 AND id = ANY($2)
-`, s.tableName)
-
-	if _, err := s.db.Exec(ctx, query, s.claimOwner, messageIDs(messages), errorString(cause)); err != nil {
+	if err := s.queries.ReleaseClaimedOutboxMessages(ctx, postgresqlc.ReleaseClaimedOutboxMessagesParams{
+		LastError: requiredText(errorString(cause)),
+		ClaimedBy: requiredText(s.claimOwner),
+		Ids:       messageIDs(messages),
+	}); err != nil {
 		return fmt.Errorf("release claimed outbox messages: %w", err)
 	}
 
 	return nil
 }
 
-func scanPostgresMessage(rows pgx.Rows) (outboxpg.MessageRecord, error) {
-	var record outboxpg.MessageRecord
-	if err := rows.Scan(
-		&record.ID,
-		&record.Channel,
-		&record.AffinityKey,
-		&record.Payload,
-		&record.Metadata,
-		&record.OccurredAt,
-	); err != nil {
-		return outboxpg.MessageRecord{}, fmt.Errorf("scan outbox message: %w", err)
-	}
-
-	return record, nil
-}
-
-func toMessage(record outboxpg.MessageRecord) (outbox.Message, error) {
+func toMessage(record postgresqlc.ClaimOutboxMessagesRow) (outbox.Message, error) {
 	var metadata outbox.Metadata
 	if len(record.Metadata) > 0 {
 		if err := json.Unmarshal(record.Metadata, &metadata); err != nil {
@@ -281,14 +228,18 @@ func toMessage(record outboxpg.MessageRecord) (outbox.Message, error) {
 		Channel:    outbox.Channel(record.Channel),
 		Payload:    outbox.Payload(record.Payload),
 		Metadata:   metadata,
-		OccurredAt: record.OccurredAt.UTC(),
+		OccurredAt: record.OccurredAt.Time.UTC(),
 	}
 
-	if record.AffinityKey != nil {
-		message.AffinityKey = outbox.AffinityKey(*record.AffinityKey)
+	if record.AffinityKey.Valid {
+		message.AffinityKey = outbox.AffinityKey(record.AffinityKey.String)
 	}
 
 	return message, nil
+}
+
+func requiredText(value string) pgtype.Text {
+	return pgtype.Text{String: value, Valid: true}
 }
 
 func messageIDs(messages []outbox.Message) []string {

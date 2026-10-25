@@ -103,7 +103,7 @@ Fields:
 | Field | Required | Description |
 | --- | --- | --- |
 | `dsn` | yes | PostgreSQL connection string. |
-| `table_name` | no | Outbox table name. Default is `outbox_messages`. |
+| `table_name` | no | Must be `outbox_messages`; this is the default. |
 | `batch_size` | no | Max messages fetched per poll. Default is `100`. |
 | `poll_interval` | no | Delay when no messages are found. Default is `1s`. |
 | `claim_lease` | no | How long a forwarder owns a claimed batch before another forwarder can retry it. Default is `30s`. |
@@ -112,7 +112,7 @@ Fields:
 
 `initialize_schema` is executed before the first subscribe loop. If schema initialization fails, the service fails fast and does not start processing.
 
-Current schema initialization supports the default table name `outbox_messages`.
+The PostgreSQL source and embedded schema initialization use the `outbox_messages` table.
 
 The PostgreSQL source claims rows before publishing and deletes them only after the publish succeeds. If publishing fails, the claim is released and the row can be retried. If the process crashes after publishing but before delete, the message can be published again after the claim lease expires, so consumers should treat delivery as at-least-once and use `Message.ID` for idempotency.
 
@@ -475,9 +475,9 @@ Set `source.type: postgres`.
 
 Publisher type must be `rabbitmq`, `rabbit`, or `kafka`.
 
-`initialize_schema only supports table_name "outbox_messages"`
+`postgres source only supports table_name "outbox_messages"`
 
-Embedded migrations currently create the default table. Use `table_name: outbox_messages` or disable `initialize_schema` and manage custom schema yourself. Custom tables must include the claim columns `claimed_by`, `claimed_until`, `attempts`, and `last_error`.
+The generated PostgreSQL queries target the default table. Use `table_name: outbox_messages`.
 
 No messages are published.
 
