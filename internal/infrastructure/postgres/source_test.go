@@ -3,13 +3,16 @@ package postgres
 import (
 	"context"
 	"errors"
+	"math"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgtype"
 
+	postgresqlc "github.com/petretiandrea/outbox-go/internal/infrastructure/postgres/sqlc"
 	"github.com/petretiandrea/outbox-go/pkg/outbox"
 )
 
@@ -24,6 +27,20 @@ func TestNewPollerSourceDefaultsClaimConfig(t *testing.T) {
 	}
 	if strings.TrimSpace(source.claimOwner) == "" {
 		t.Fatal("expected default claim owner")
+	}
+}
+
+func TestNewPollerSourceRejectsCustomTableName(t *testing.T) {
+	_, err := NewPollerSource(&fakeExecutor{}, SourceConfig{TableName: "custom_outbox_messages"})
+	if err == nil {
+		t.Fatal("expected custom table name to be rejected")
+	}
+}
+
+func TestNewPollerSourceRejectsBatchSizeOutsideSQLCIntegerRange(t *testing.T) {
+	_, err := NewPollerSource(&fakeExecutor{}, SourceConfig{BatchSize: math.MaxInt32 + 1})
+	if err == nil {
+		t.Fatal("expected oversized batch size to be rejected")
 	}
 }
 
@@ -43,8 +60,7 @@ func TestClaimBatchClaimsAvailableMessages(t *testing.T) {
 		},
 	}
 	source := &PollerSource{
-		db:         executor,
-		tableName:  "outbox_messages",
+		queries:    postgresqlc.New(executor),
 		batchSize:  10,
 		claimOwner: "worker-1",
 		claimLease: time.Minute,
@@ -67,10 +83,10 @@ func TestClaimBatchClaimsAvailableMessages(t *testing.T) {
 	if !strings.Contains(executor.querySQL, "FROM claimed\nORDER BY occurred_at ASC, id ASC") {
 		t.Fatalf("expected claimed rows to be returned in occurrence order, got %s", executor.querySQL)
 	}
-	if executor.queryArgs[0] != 10 {
+	if executor.queryArgs[0] != int32(10) {
 		t.Fatalf("expected batch size arg 10, got %v", executor.queryArgs[0])
 	}
-	if executor.queryArgs[1] != "worker-1" {
+	if executor.queryArgs[1] != (pgtype.Text{String: "worker-1", Valid: true}) {
 		t.Fatalf("expected claim owner arg worker-1, got %v", executor.queryArgs[1])
 	}
 	if executor.queryArgs[2] != int64(time.Minute/time.Millisecond) {
@@ -81,8 +97,7 @@ func TestClaimBatchClaimsAvailableMessages(t *testing.T) {
 func TestDeleteMessagesDeletesOnlyClaimedMessages(t *testing.T) {
 	executor := &fakeExecutor{commandTag: pgconn.NewCommandTag("DELETE 2")}
 	source := &PollerSource{
-		db:         executor,
-		tableName:  "outbox_messages",
+		queries:    postgresqlc.New(executor),
 		claimOwner: "worker-1",
 	}
 
@@ -100,7 +115,7 @@ func TestDeleteMessagesDeletesOnlyClaimedMessages(t *testing.T) {
 	if !strings.Contains(executor.execSQL, "claimed_by = $1") {
 		t.Fatalf("expected delete query to filter by claim owner, got %s", executor.execSQL)
 	}
-	if executor.execArgs[0] != "worker-1" {
+	if executor.execArgs[0] != (pgtype.Text{String: "worker-1", Valid: true}) {
 		t.Fatalf("expected claim owner arg worker-1, got %v", executor.execArgs[0])
 	}
 
@@ -116,8 +131,7 @@ func TestDeleteMessagesDeletesOnlyClaimedMessages(t *testing.T) {
 func TestDeleteMessagesReturnsErrorWhenClaimWasLost(t *testing.T) {
 	executor := &fakeExecutor{commandTag: pgconn.NewCommandTag("DELETE 0")}
 	source := &PollerSource{
-		db:         executor,
-		tableName:  "outbox_messages",
+		queries:    postgresqlc.New(executor),
 		claimOwner: "worker-1",
 	}
 
@@ -132,8 +146,7 @@ func TestDeleteMessagesReturnsErrorWhenClaimWasLost(t *testing.T) {
 func TestReleaseMessagesClearsClaimAndStoresError(t *testing.T) {
 	executor := &fakeExecutor{}
 	source := &PollerSource{
-		db:         executor,
-		tableName:  "outbox_messages",
+		queries:    postgresqlc.New(executor),
 		claimOwner: "worker-1",
 	}
 
@@ -148,8 +161,8 @@ func TestReleaseMessagesClearsClaimAndStoresError(t *testing.T) {
 	if !strings.Contains(executor.execSQL, "claimed_by = NULL") {
 		t.Fatalf("expected release query to clear claim, got %s", executor.execSQL)
 	}
-	if executor.execArgs[2] != cause.Error() {
-		t.Fatalf("expected last_error arg %q, got %v", cause.Error(), executor.execArgs[2])
+	if executor.execArgs[0] != (pgtype.Text{String: cause.Error(), Valid: true}) {
+		t.Fatalf("expected last_error arg %q, got %v", cause.Error(), executor.execArgs[0])
 	}
 }
 
@@ -179,6 +192,8 @@ func (e *fakeExecutor) Exec(_ context.Context, sql string, args ...any) (pgconn.
 	}
 	return e.commandTag, nil
 }
+
+func (e *fakeExecutor) QueryRow(context.Context, string, ...any) pgx.Row { return nil }
 
 type rowRecord struct {
 	id          string
@@ -214,10 +229,14 @@ func (r *fakeRows) Scan(dest ...any) error {
 	record := r.records[r.idx-1]
 	*(dest[0].(*string)) = record.id
 	*(dest[1].(*string)) = record.channel
-	*(dest[2].(**string)) = record.affinityKey
+	affinityKey := dest[2].(*pgtype.Text)
+	if record.affinityKey != nil {
+		affinityKey.String = *record.affinityKey
+		affinityKey.Valid = true
+	}
 	*(dest[3].(*[]byte)) = record.payload
 	*(dest[4].(*[]byte)) = record.metadata
-	*(dest[5].(*time.Time)) = record.occurredAt
+	*(dest[5].(*pgtype.Timestamptz)) = pgtype.Timestamptz{Time: record.occurredAt, Valid: true}
 	return nil
 }
 
