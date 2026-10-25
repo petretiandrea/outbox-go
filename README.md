@@ -106,15 +106,15 @@ Fields:
 | `table_name` | no | Must be `outbox_messages`; this is the default. |
 | `batch_size` | no | Max messages fetched per poll. Default is `100`. |
 | `poll_interval` | no | Delay when no messages are found. Default is `1s`. |
-| `claim_lease` | no | How long a forwarder owns a claimed batch before another forwarder can retry it. Default is `30s`. |
-| `claim_owner` | no | Identifier stored in claimed rows. Default is generated from hostname and process id. |
+| `claim_lease` | no | How long a forwarder owns a claimed batch before another forwarder can retry it. Default is `30s`; positive values below `1ms` are rejected. |
+| `claim_owner` | no | Identifier stored in claimed rows. Default is generated from hostname and process id. Every acquired batch also receives a unique internal claim token, so owners may safely be reused. |
 | `initialize_schema` | no | If `true`, runs embedded PostgreSQL migrations during startup before subscribing. Default is `false`. |
 
 `initialize_schema` is executed before the first subscribe loop. If schema initialization fails, the service fails fast and does not start processing.
 
 The PostgreSQL source and embedded schema initialization use the `outbox_messages` table.
 
-The PostgreSQL source claims rows before publishing and deletes them only after the publish succeeds. If publishing fails, the claim is released and the row can be retried. If the process crashes after publishing but before delete, the message can be published again after the claim lease expires, so consumers should treat delivery as at-least-once and use `Message.ID` for idempotency.
+The PostgreSQL source claims rows before publishing and deletes them only after the publish succeeds. Each claim has a random token; delete, release, and renewal require both the configured owner and that token. The source renews a claim while its handler is running. If publishing fails, the claim is released with its token and the row can be retried. If the process crashes after publishing but before delete, or a lease renewal cannot reach PostgreSQL, the message can still be published again after the lease expires. Consumers must therefore treat delivery as at-least-once and use `Message.ID` for idempotency.
 
 ### Ordering
 
@@ -454,7 +454,7 @@ Only add `args` if you mount the config somewhere else.
 - The forwarder uses at-least-once delivery. Consumers should be idempotent by `Message.ID`.
 - Multiple replicas can share the same table because rows are claimed with a lease before publishing.
 - `AffinityKey` is not a cross-replica ordering lock; it identifies a destination partition or shard only.
-- Set `claim_lease` longer than the expected maximum publish time. If the process crashes, another replica can retry after the lease expires.
+- Choose a `claim_lease` that tolerates transient database outages. Active handlers renew their lease, but if renewal fails the claim can be reclaimed after the last successful lease; a slow handler may then overlap with the new worker. Completion from the stale claim is fenced, but a publish already in flight cannot be undone.
 - `initialize_schema: true` is useful for development and simple deployments.
 - In stricter production environments, you may prefer to run migrations outside the service and set `initialize_schema: false`.
 - The forwarder fails startup if the source or publishers cannot be created.

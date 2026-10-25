@@ -44,6 +44,13 @@ func TestNewPollerSourceRejectsBatchSizeOutsideSQLCIntegerRange(t *testing.T) {
 	}
 }
 
+func TestNewPollerSourceRejectsClaimLeaseBelowDatabasePrecision(t *testing.T) {
+	_, err := NewPollerSource(&fakeExecutor{}, SourceConfig{ClaimLease: time.Nanosecond})
+	if err == nil {
+		t.Fatal("expected sub-millisecond claim lease to be rejected")
+	}
+}
+
 func TestClaimBatchClaimsAvailableMessages(t *testing.T) {
 	occurredAt := time.Date(2026, 6, 22, 12, 0, 0, 0, time.UTC)
 	executor := &fakeExecutor{
@@ -66,16 +73,19 @@ func TestClaimBatchClaimsAvailableMessages(t *testing.T) {
 		claimLease: time.Minute,
 	}
 
-	messages, err := source.claimBatch(context.Background())
+	claimed, err := source.claimBatch(context.Background())
 	if err != nil {
 		t.Fatalf("claimBatch returned error: %v", err)
 	}
 
-	if len(messages) != 1 {
-		t.Fatalf("expected one message, got %d", len(messages))
+	if len(claimed.messages) != 1 {
+		t.Fatalf("expected one message, got %d", len(claimed.messages))
 	}
-	if messages[0].ID != "message-1" {
-		t.Fatalf("expected message id message-1, got %q", messages[0].ID)
+	if claimed.messages[0].ID != "message-1" {
+		t.Fatalf("expected message id message-1, got %q", claimed.messages[0].ID)
+	}
+	if claimed.claimToken == "" {
+		t.Fatal("expected a per-claim token")
 	}
 	if !strings.Contains(executor.querySQL, "FOR UPDATE SKIP LOCKED") {
 		t.Fatalf("expected claim query to use SKIP LOCKED, got %s", executor.querySQL)
@@ -89,8 +99,11 @@ func TestClaimBatchClaimsAvailableMessages(t *testing.T) {
 	if executor.queryArgs[1] != (pgtype.Text{String: "worker-1", Valid: true}) {
 		t.Fatalf("expected claim owner arg worker-1, got %v", executor.queryArgs[1])
 	}
-	if executor.queryArgs[2] != int64(time.Minute/time.Millisecond) {
-		t.Fatalf("expected claim lease milliseconds, got %v", executor.queryArgs[2])
+	if executor.queryArgs[2] == (pgtype.Text{}) {
+		t.Fatal("expected a claim token argument")
+	}
+	if executor.queryArgs[3] != int64(time.Minute/time.Millisecond) {
+		t.Fatalf("expected claim lease milliseconds, got %v", executor.queryArgs[3])
 	}
 }
 
@@ -101,10 +114,7 @@ func TestDeleteMessagesDeletesOnlyClaimedMessages(t *testing.T) {
 		claimOwner: "worker-1",
 	}
 
-	err := source.deleteMessages(context.Background(), []outbox.Message{
-		{ID: "message-1"},
-		{ID: "message-2"},
-	})
+	err := source.deleteMessages(context.Background(), claimedBatch{claimToken: "claim-1", messages: []outbox.Message{{ID: "message-1"}, {ID: "message-2"}}})
 	if err != nil {
 		t.Fatalf("deleteMessages returned error: %v", err)
 	}
@@ -119,7 +129,11 @@ func TestDeleteMessagesDeletesOnlyClaimedMessages(t *testing.T) {
 		t.Fatalf("expected claim owner arg worker-1, got %v", executor.execArgs[0])
 	}
 
-	ids, ok := executor.execArgs[1].([]string)
+	if executor.execArgs[1] != (pgtype.Text{String: "claim-1", Valid: true}) {
+		t.Fatalf("expected claim token arg claim-1, got %v", executor.execArgs[1])
+	}
+
+	ids, ok := executor.execArgs[2].([]string)
 	if !ok {
 		t.Fatalf("expected []string ids arg, got %T", executor.execArgs[1])
 	}
@@ -128,32 +142,33 @@ func TestDeleteMessagesDeletesOnlyClaimedMessages(t *testing.T) {
 	}
 }
 
-func TestDeleteMessagesReturnsErrorWhenClaimWasLost(t *testing.T) {
+func TestDeleteMessagesRejectsStaleCompletionAfterExpiryAndReclaimWithReusedOwner(t *testing.T) {
 	executor := &fakeExecutor{commandTag: pgconn.NewCommandTag("DELETE 0")}
 	source := &PollerSource{
-		queries:    postgresqlc.New(executor),
-		claimOwner: "worker-1",
+		queries: postgresqlc.New(executor),
+		// Both workers deliberately use this same configured owner. A newer
+		// claim with another token causes the old worker's DELETE to affect zero rows.
+		claimOwner: "shared-owner",
 	}
 
-	err := source.deleteMessages(context.Background(), []outbox.Message{
-		{ID: "message-1"},
-	})
+	err := source.deleteMessages(context.Background(), claimedBatch{claimToken: "expired-claim-token", messages: []outbox.Message{{ID: "message-1"}}})
 	if err == nil {
-		t.Fatal("expected delete mismatch error")
+		t.Fatal("expected stale completion to be rejected")
+	}
+	if !strings.Contains(executor.execSQL, "claim_token = $2") {
+		t.Fatalf("expected completion to fence by token, got %s", executor.execSQL)
 	}
 }
 
 func TestReleaseMessagesClearsClaimAndStoresError(t *testing.T) {
-	executor := &fakeExecutor{}
+	executor := &fakeExecutor{commandTag: pgconn.NewCommandTag("UPDATE 1")}
 	source := &PollerSource{
 		queries:    postgresqlc.New(executor),
 		claimOwner: "worker-1",
 	}
 
 	cause := errors.New("publish failed")
-	err := source.releaseMessages(context.Background(), []outbox.Message{
-		{ID: "message-1"},
-	}, cause)
+	err := source.releaseMessages(context.Background(), claimedBatch{claimToken: "claim-1", messages: []outbox.Message{{ID: "message-1"}}}, cause)
 	if err != nil {
 		t.Fatalf("releaseMessages returned error: %v", err)
 	}
@@ -164,6 +179,72 @@ func TestReleaseMessagesClearsClaimAndStoresError(t *testing.T) {
 	if executor.execArgs[0] != (pgtype.Text{String: cause.Error(), Valid: true}) {
 		t.Fatalf("expected last_error arg %q, got %v", cause.Error(), executor.execArgs[0])
 	}
+	if !strings.Contains(executor.execSQL, "claim_token = $3") {
+		t.Fatalf("expected release to fence by token, got %s", executor.execSQL)
+	}
+}
+
+func TestReleaseMessagesRejectsLostClaim(t *testing.T) {
+	executor := &fakeExecutor{commandTag: pgconn.NewCommandTag("UPDATE 0")}
+	source := &PollerSource{queries: postgresqlc.New(executor), claimOwner: "shared-owner"}
+
+	err := source.releaseMessages(context.Background(), claimedBatch{claimToken: "stale-token", messages: []outbox.Message{{ID: "message-1"}}}, errors.New("publish failed"))
+	if err == nil {
+		t.Fatal("expected stale release to be rejected")
+	}
+}
+
+func TestRenewClaimRejectsStaleClaimWithReusedOwner(t *testing.T) {
+	executor := &fakeExecutor{commandTag: pgconn.NewCommandTag("UPDATE 0")}
+	source := &PollerSource{queries: postgresqlc.New(executor), claimOwner: "shared-owner", claimLease: time.Second}
+
+	err := source.renewClaim(context.Background(), claimedBatch{claimToken: "stale-token", messages: []outbox.Message{{ID: "message-1"}}})
+	if err == nil {
+		t.Fatal("expected stale claim renewal to fail")
+	}
+	if !strings.Contains(executor.execSQL, "claim_token = $3") {
+		t.Fatalf("expected renewal to fence by token, got %s", executor.execSQL)
+	}
+}
+
+func TestHandleWithRenewalRenewsSlowHandler(t *testing.T) {
+	executor := &fakeExecutor{commandTag: pgconn.NewCommandTag("UPDATE 1")}
+	source := &PollerSource{queries: postgresqlc.New(executor), claimOwner: "worker-1", claimLease: 2 * time.Millisecond}
+	claimed := claimedBatch{claimToken: "claim-1", messages: []outbox.Message{{ID: "message-1"}}}
+
+	handlerErr, renewErr := source.handleWithRenewal(claimed, func(...*outbox.Message) error {
+		time.Sleep(4 * time.Millisecond)
+		return nil
+	}, []*outbox.Message{{ID: "message-1"}})
+	if handlerErr != nil || renewErr != nil {
+		t.Fatalf("expected slow handler renewal to succeed, got handler=%v renewal=%v", handlerErr, renewErr)
+	}
+	if !strings.Contains(executor.execSQL, "SET claimed_until") {
+		t.Fatalf("expected a renewal query, got %s", executor.execSQL)
+	}
+}
+
+func TestSubscribeReleasesClaimAfterCancellationUsingCleanupContext(t *testing.T) {
+	executor := &fakeExecutor{commandTag: pgconn.NewCommandTag("UPDATE 1"), rows: &fakeRows{records: []rowRecord{{
+		id: "message-1", channel: "orders.created", occurredAt: time.Now(),
+	}}}}
+	source := &PollerSource{
+		queries: postgresqlc.New(executor), batchSize: 1, claimOwner: "shared-owner", claimLease: time.Second,
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	err := source.Subscribe(ctx, func(...*outbox.Message) error {
+		cancel()
+		return ctx.Err()
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected cancellation error, got %v", err)
+	}
+	if executor.execCtx == nil || !executor.execContextWasLive {
+		t.Fatal("expected release to use a live cleanup context after cancellation")
+	}
+	if !strings.Contains(executor.execSQL, "claim_token = $3") {
+		t.Fatalf("expected release to fence by claim token, got %s", executor.execSQL)
+	}
 }
 
 type fakeExecutor struct {
@@ -172,6 +253,8 @@ type fakeExecutor struct {
 	queryArgs  []any
 	execSQL    string
 	execArgs   []any
+	execCtx               context.Context
+	execContextWasLive    bool
 	commandTag pgconn.CommandTag
 }
 
@@ -184,7 +267,9 @@ func (e *fakeExecutor) Query(_ context.Context, sql string, args ...any) (pgx.Ro
 	return e.rows, nil
 }
 
-func (e *fakeExecutor) Exec(_ context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
+func (e *fakeExecutor) Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
+	e.execCtx = ctx
+	e.execContextWasLive = ctx.Err() == nil
 	e.execSQL = sql
 	e.execArgs = args
 	if e.commandTag.String() == "" {
