@@ -2,6 +2,7 @@ package postgres
 
 import (
 	"context"
+	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -43,6 +44,11 @@ type PollerSource struct {
 	closeFn      func() error
 }
 
+type claimedBatch struct {
+	messages   []outbox.Message
+	claimToken string
+}
+
 func NewPollerSource(db postgresqlc.DBTX, config SourceConfig) (*PollerSource, error) {
 	if db == nil {
 		return nil, errors.New("postgres source requires a query executor")
@@ -70,8 +76,11 @@ func NewPollerSource(db postgresqlc.DBTX, config SourceConfig) (*PollerSource, e
 	}
 
 	claimLease := config.ClaimLease
-	if claimLease <= 0 {
+	if claimLease == 0 {
 		claimLease = defaultClaimLease
+	}
+	if claimLease < time.Millisecond {
+		return nil, errors.New("postgres source claim lease must be at least 1ms")
 	}
 
 	claimOwner := strings.TrimSpace(config.ClaimOwner)
@@ -119,12 +128,12 @@ func (s *PollerSource) Subscribe(ctx context.Context, handler func(...*outbox.Me
 		default:
 		}
 
-		messages, err := s.claimBatch(ctx)
+		claimed, err := s.claimBatch(ctx)
 		if err != nil {
 			return err
 		}
 
-		if len(messages) == 0 {
+		if len(claimed.messages) == 0 {
 			timer := time.NewTimer(s.pollInterval)
 			select {
 			case <-ctx.Done():
@@ -135,19 +144,27 @@ func (s *PollerSource) Subscribe(ctx context.Context, handler func(...*outbox.Me
 			continue
 		}
 
-		batch := make([]*outbox.Message, 0, len(messages))
-		for idx := range messages {
-			batch = append(batch, &messages[idx])
+		batch := make([]*outbox.Message, 0, len(claimed.messages))
+		for idx := range claimed.messages {
+			batch = append(batch, &claimed.messages[idx])
 		}
 
-		if err := handler(batch...); err != nil {
-			if releaseErr := s.releaseMessages(ctx, messages, err); releaseErr != nil {
-				return errors.Join(err, releaseErr)
+		handlerErr, renewErr := s.handleWithRenewal(claimed, handler, batch)
+		if handlerErr != nil {
+			cleanupCtx, cancel := cleanupContext(s.claimLease)
+			releaseErr := s.releaseMessages(cleanupCtx, claimed, handlerErr)
+			cancel()
+			if releaseErr != nil {
+				return errors.Join(handlerErr, renewErr, releaseErr)
 			}
-			return err
+			return errors.Join(handlerErr, renewErr)
 		}
 
-		if err := s.deleteMessages(ctx, messages); err != nil {
+		if renewErr != nil {
+			return renewErr
+		}
+
+		if err := s.deleteMessages(ctx, claimed); err != nil {
 			return err
 		}
 	}
@@ -157,62 +174,142 @@ func (s *PollerSource) Close() error {
 	return s.closeFn()
 }
 
-func (s *PollerSource) claimBatch(ctx context.Context) ([]outbox.Message, error) {
+func (s *PollerSource) claimBatch(ctx context.Context) (claimedBatch, error) {
+	claimToken, err := newClaimToken()
+	if err != nil {
+		return claimedBatch{}, err
+	}
+
 	records, err := s.queries.ClaimOutboxMessages(ctx, postgresqlc.ClaimOutboxMessagesParams{
 		BatchSize:              int32(s.batchSize),
 		ClaimedBy:              requiredText(s.claimOwner),
+		ClaimToken:             requiredText(claimToken),
 		ClaimLeaseMilliseconds: s.claimLease.Milliseconds(),
 	})
 	if err != nil {
-		return nil, fmt.Errorf("claim outbox messages: %w", err)
+		return claimedBatch{}, fmt.Errorf("claim outbox messages: %w", err)
 	}
 
 	messages := make([]outbox.Message, 0, len(records))
 	for _, record := range records {
 		message, err := toMessage(record)
 		if err != nil {
-			return nil, err
+			return claimedBatch{}, err
 		}
 
 		messages = append(messages, message)
 	}
 
-	return messages, nil
+	return claimedBatch{messages: messages, claimToken: claimToken}, nil
 }
 
-func (s *PollerSource) deleteMessages(ctx context.Context, messages []outbox.Message) error {
-	if len(messages) == 0 {
+func (s *PollerSource) deleteMessages(ctx context.Context, claimed claimedBatch) error {
+	if len(claimed.messages) == 0 {
 		return nil
 	}
 
 	deleted, err := s.queries.DeleteClaimedOutboxMessages(ctx, postgresqlc.DeleteClaimedOutboxMessagesParams{
-		ClaimedBy: requiredText(s.claimOwner),
-		Ids:       messageIDs(messages),
+		ClaimedBy:  requiredText(s.claimOwner),
+		ClaimToken: requiredText(claimed.claimToken),
+		Ids:        messageIDs(claimed.messages),
 	})
 	if err != nil {
 		return fmt.Errorf("delete processed outbox messages: %w", err)
 	}
-	if deleted != int64(len(messages)) {
-		return fmt.Errorf("delete processed outbox messages: deleted %d of %d claimed messages", deleted, len(messages))
+	if deleted != int64(len(claimed.messages)) {
+		return fmt.Errorf("delete processed outbox messages: deleted %d of %d claimed messages (claim was lost)", deleted, len(claimed.messages))
 	}
 
 	return nil
 }
 
-func (s *PollerSource) releaseMessages(ctx context.Context, messages []outbox.Message, cause error) error {
-	if len(messages) == 0 {
+func (s *PollerSource) releaseMessages(ctx context.Context, claimed claimedBatch, cause error) error {
+	if len(claimed.messages) == 0 {
 		return nil
 	}
 
-	if err := s.queries.ReleaseClaimedOutboxMessages(ctx, postgresqlc.ReleaseClaimedOutboxMessagesParams{
+	released, err := s.queries.ReleaseClaimedOutboxMessages(ctx, postgresqlc.ReleaseClaimedOutboxMessagesParams{
 		LastError: requiredText(errorString(cause)),
 		ClaimedBy: requiredText(s.claimOwner),
-		Ids:       messageIDs(messages),
-	}); err != nil {
+		ClaimToken: requiredText(claimed.claimToken),
+		Ids:        messageIDs(claimed.messages),
+	})
+	if err != nil {
 		return fmt.Errorf("release claimed outbox messages: %w", err)
+	}
+	if released != int64(len(claimed.messages)) {
+		return fmt.Errorf("release claimed outbox messages: released %d of %d claimed messages (claim was lost)", released, len(claimed.messages))
 	}
 
 	return nil
+}
+
+func (s *PollerSource) handleWithRenewal(claimed claimedBatch, handler func(...*outbox.Message) error, batch []*outbox.Message) (error, error) {
+	stop := make(chan struct{})
+	workerDone := make(chan struct{})
+	renewErr := make(chan error, 1)
+	go func() {
+		defer close(workerDone)
+		interval := s.claimLease / 2
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				renewCtx, cancel := context.WithTimeout(context.Background(), s.claimLease)
+				err := s.renewClaim(renewCtx, claimed)
+				cancel()
+				if err != nil {
+					renewErr <- err
+					return
+				}
+			case <-stop:
+				return
+			}
+		}
+	}()
+
+	handlerErr := handler(batch...)
+	close(stop)
+	<-workerDone
+	return handlerErr, receiveRenewalError(renewErr)
+}
+
+func (s *PollerSource) renewClaim(ctx context.Context, claimed claimedBatch) error {
+	renewed, err := s.queries.RenewClaimedOutboxMessages(ctx, postgresqlc.RenewClaimedOutboxMessagesParams{
+		ClaimLeaseMilliseconds: s.claimLease.Milliseconds(),
+		ClaimedBy:              requiredText(s.claimOwner),
+		ClaimToken:             requiredText(claimed.claimToken),
+		Ids:                    messageIDs(claimed.messages),
+	})
+	if err != nil {
+		return fmt.Errorf("renew claimed outbox messages: %w", err)
+	}
+	if renewed != int64(len(claimed.messages)) {
+		return fmt.Errorf("renew claimed outbox messages: renewed %d of %d claimed messages (claim was lost)", renewed, len(claimed.messages))
+	}
+	return nil
+}
+
+func receiveRenewalError(errs <-chan error) error {
+	select {
+	case err := <-errs:
+		return err
+	default:
+		return nil
+	}
+}
+
+func cleanupContext(lease time.Duration) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.Background(), lease)
+}
+
+func newClaimToken() (string, error) {
+	var token [16]byte
+	if _, err := rand.Read(token[:]); err != nil {
+		return "", fmt.Errorf("generate claim token: %w", err)
+	}
+	return fmt.Sprintf("%x", token), nil
 }
 
 func toMessage(record postgresqlc.ClaimOutboxMessagesRow) (outbox.Message, error) {

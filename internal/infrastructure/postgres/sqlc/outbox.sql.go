@@ -23,7 +23,8 @@ WITH candidate AS (
 claimed AS (
     UPDATE outbox_messages AS outbox
     SET claimed_by = $2,
-        claimed_until = now() + ($3::bigint * interval '1 millisecond'),
+        claim_token = $3,
+        claimed_until = now() + ($4::bigint * interval '1 millisecond'),
         attempts = attempts + 1,
         last_error = NULL
     FROM candidate
@@ -38,6 +39,7 @@ ORDER BY occurred_at ASC, id ASC
 type ClaimOutboxMessagesParams struct {
 	BatchSize              int32       `json:"batch_size"`
 	ClaimedBy              pgtype.Text `json:"claimed_by"`
+	ClaimToken             pgtype.Text `json:"claim_token"`
 	ClaimLeaseMilliseconds int64       `json:"claim_lease_milliseconds"`
 }
 
@@ -51,7 +53,7 @@ type ClaimOutboxMessagesRow struct {
 }
 
 func (q *Queries) ClaimOutboxMessages(ctx context.Context, arg ClaimOutboxMessagesParams) ([]ClaimOutboxMessagesRow, error) {
-	rows, err := q.db.Query(ctx, claimOutboxMessages, arg.BatchSize, arg.ClaimedBy, arg.ClaimLeaseMilliseconds)
+	rows, err := q.db.Query(ctx, claimOutboxMessages, arg.BatchSize, arg.ClaimedBy, arg.ClaimToken, arg.ClaimLeaseMilliseconds)
 	if err != nil {
 		return nil, err
 	}
@@ -80,38 +82,72 @@ func (q *Queries) ClaimOutboxMessages(ctx context.Context, arg ClaimOutboxMessag
 const deleteClaimedOutboxMessages = `-- name: DeleteClaimedOutboxMessages :execrows
 DELETE FROM outbox_messages
 WHERE claimed_by = $1
-  AND id = ANY($2::text[])
+  AND claim_token = $2
+  AND claimed_until > now()
+  AND id = ANY($3::text[])
 `
 
 type DeleteClaimedOutboxMessagesParams struct {
 	ClaimedBy pgtype.Text `json:"claimed_by"`
+	ClaimToken pgtype.Text `json:"claim_token"`
 	Ids       []string    `json:"ids"`
 }
 
 func (q *Queries) DeleteClaimedOutboxMessages(ctx context.Context, arg DeleteClaimedOutboxMessagesParams) (int64, error) {
-	result, err := q.db.Exec(ctx, deleteClaimedOutboxMessages, arg.ClaimedBy, arg.Ids)
+	result, err := q.db.Exec(ctx, deleteClaimedOutboxMessages, arg.ClaimedBy, arg.ClaimToken, arg.Ids)
 	if err != nil {
 		return 0, err
 	}
 	return result.RowsAffected(), nil
 }
 
-const releaseClaimedOutboxMessages = `-- name: ReleaseClaimedOutboxMessages :exec
+const releaseClaimedOutboxMessages = `-- name: ReleaseClaimedOutboxMessages :execrows
 UPDATE outbox_messages
 SET claimed_by = NULL,
+    claim_token = NULL,
     claimed_until = NULL,
     last_error = $1
 WHERE claimed_by = $2
-  AND id = ANY($3::text[])
+  AND claim_token = $3
+  AND claimed_until > now()
+  AND id = ANY($4::text[])
 `
 
 type ReleaseClaimedOutboxMessagesParams struct {
 	LastError pgtype.Text `json:"last_error"`
 	ClaimedBy pgtype.Text `json:"claimed_by"`
+	ClaimToken pgtype.Text `json:"claim_token"`
 	Ids       []string    `json:"ids"`
 }
 
-func (q *Queries) ReleaseClaimedOutboxMessages(ctx context.Context, arg ReleaseClaimedOutboxMessagesParams) error {
-	_, err := q.db.Exec(ctx, releaseClaimedOutboxMessages, arg.LastError, arg.ClaimedBy, arg.Ids)
-	return err
+func (q *Queries) ReleaseClaimedOutboxMessages(ctx context.Context, arg ReleaseClaimedOutboxMessagesParams) (int64, error) {
+	result, err := q.db.Exec(ctx, releaseClaimedOutboxMessages, arg.LastError, arg.ClaimedBy, arg.ClaimToken, arg.Ids)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const renewClaimedOutboxMessages = `-- name: RenewClaimedOutboxMessages :execrows
+UPDATE outbox_messages
+SET claimed_until = now() + ($1::bigint * interval '1 millisecond')
+WHERE claimed_by = $2
+  AND claim_token = $3
+  AND claimed_until > now()
+  AND id = ANY($4::text[])
+`
+
+type RenewClaimedOutboxMessagesParams struct {
+	ClaimLeaseMilliseconds int64       `json:"claim_lease_milliseconds"`
+	ClaimedBy              pgtype.Text `json:"claimed_by"`
+	ClaimToken             pgtype.Text `json:"claim_token"`
+	Ids                    []string    `json:"ids"`
+}
+
+func (q *Queries) RenewClaimedOutboxMessages(ctx context.Context, arg RenewClaimedOutboxMessagesParams) (int64, error) {
+	result, err := q.db.Exec(ctx, renewClaimedOutboxMessages, arg.ClaimLeaseMilliseconds, arg.ClaimedBy, arg.ClaimToken, arg.Ids)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }
