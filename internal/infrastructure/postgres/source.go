@@ -167,15 +167,20 @@ WITH candidate AS (
     ORDER BY occurred_at ASC, id ASC
     LIMIT $1
     FOR UPDATE SKIP LOCKED
+),
+claimed AS (
+    UPDATE %s AS outbox
+    SET claimed_by = $2,
+        claimed_until = now() + ($3 * interval '1 millisecond'),
+        attempts = attempts + 1,
+        last_error = NULL
+    FROM candidate
+    WHERE outbox.id = candidate.id
+    RETURNING outbox.id, outbox.channel, outbox.affinity_key, outbox.payload, outbox.metadata, outbox.occurred_at
 )
-UPDATE %s AS outbox
-SET claimed_by = $2,
-    claimed_until = now() + ($3 * interval '1 millisecond'),
-    attempts = attempts + 1,
-    last_error = NULL
-FROM candidate
-WHERE outbox.id = candidate.id
-RETURNING outbox.id, outbox.channel, outbox.affinity_key, outbox.payload, outbox.metadata, outbox.occurred_at
+SELECT id, channel, affinity_key, payload, metadata, occurred_at
+FROM claimed
+ORDER BY occurred_at ASC, id ASC
 `, s.tableName, s.tableName)
 
 	rows, err := s.db.Query(ctx, query, s.batchSize, s.claimOwner, s.claimLease.Milliseconds())

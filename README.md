@@ -116,6 +116,10 @@ Current schema initialization supports the default table name `outbox_messages`.
 
 The PostgreSQL source claims rows before publishing and deletes them only after the publish succeeds. If publishing fails, the claim is released and the row can be retried. If the process crashes after publishing but before delete, the message can be published again after the claim lease expires, so consumers should treat delivery as at-least-once and use `Message.ID` for idempotency.
 
+### Ordering
+
+Within a single PostgreSQL claim batch, messages are passed to a publisher in ascending `occurred_at`, then `id`, order. This is a deterministic batch order only: the forwarder does not serialize an `AffinityKey` across claim batches or multiple forwarder instances. Two workers can publish same-key messages concurrently, and a later message can therefore arrive first. Systems that require strict per-key delivery order must enforce sequencing or serialization at the destination or in the application.
+
 ## RabbitMQ Publisher
 
 ```yaml
@@ -449,6 +453,7 @@ Only add `args` if you mount the config somewhere else.
 - Start with `replicas: 1`.
 - The forwarder uses at-least-once delivery. Consumers should be idempotent by `Message.ID`.
 - Multiple replicas can share the same table because rows are claimed with a lease before publishing.
+- `AffinityKey` is not a cross-replica ordering lock; it identifies a destination partition or shard only.
 - Set `claim_lease` longer than the expected maximum publish time. If the process crashes, another replica can retry after the lease expires.
 - `initialize_schema: true` is useful for development and simple deployments.
 - In stricter production environments, you may prefer to run migrations outside the service and set `initialize_schema: false`.

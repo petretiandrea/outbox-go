@@ -64,6 +64,9 @@ func TestClaimBatchClaimsAvailableMessages(t *testing.T) {
 	if !strings.Contains(executor.querySQL, "FOR UPDATE SKIP LOCKED") {
 		t.Fatalf("expected claim query to use SKIP LOCKED, got %s", executor.querySQL)
 	}
+	if !strings.Contains(executor.querySQL, "FROM claimed\nORDER BY occurred_at ASC, id ASC") {
+		t.Fatalf("expected claimed rows to be returned in occurrence order, got %s", executor.querySQL)
+	}
 	if executor.queryArgs[0] != 10 {
 		t.Fatalf("expected batch size arg 10, got %v", executor.queryArgs[0])
 	}
