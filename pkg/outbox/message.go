@@ -10,7 +10,12 @@ import (
 // Channel represents the destination where the message should be published.
 type Channel string
 
-// AffinityKey is used to determine the partition or shard for the message, ensuring that messages with the same key are processed in order.
+// AffinityKey identifies the partition or shard for a message at destinations that support keys.
+//
+// The outbox forwarder preserves occurred-at and ID order within one claimed batch,
+// but it does not serialize messages with the same key across batches or forwarder
+// instances. Consumers requiring strict per-key ordering must provide sequencing or
+// serialization at the destination or application level.
 type AffinityKey string
 
 // Payload represents the data that needs to be published to the channel.
