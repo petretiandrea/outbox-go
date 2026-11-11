@@ -6,6 +6,11 @@ on:
       - main
   pull_request:
   workflow_dispatch:
+    inputs:
+      root_tag:
+        description: Existing root release tag to backfill for the nested Go module (for example, v1.7.1)
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -149,6 +154,7 @@ jobs:
           persist-credentials: false
 
       - name: Semantic release
+        id: semantic-release
         uses: cycjimmy/semantic-release-action@v4
         with:
           extra_plugins: |
@@ -157,3 +163,71 @@ jobs:
             @semantic-release/github
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Tag nested Go module
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_VERSION: ${{ needs.release-dry-run.outputs.version }}
+        run: |
+          set -euo pipefail
+          root_tag="v${RELEASE_VERSION}"
+          nested_tag="pkg/outbox/${root_tag}"
+          release_commit="$(git rev-list -n 1 "${root_tag}")"
+
+          test "$(git show "${release_commit}:pkg/outbox/go.mod" | head -n 1)" = "module github.com/petretiandrea/outbox-go/pkg/outbox"
+
+          if git ls-remote --exit-code --tags origin "refs/tags/${nested_tag}" >/dev/null 2>&1; then
+            remote_commit="$(git ls-remote origin "refs/tags/${nested_tag}^{}" | awk '{print $1}')"
+            if [ -z "${remote_commit}" ]; then
+              remote_commit="$(git ls-remote --refs origin "refs/tags/${nested_tag}" | awk '{print $1}')"
+            fi
+            test "${remote_commit}" = "${release_commit}"
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "${nested_tag}" "${release_commit}" -m "Release ${nested_tag}"
+          git push "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "refs/tags/${nested_tag}"
+
+  backfill-nested-module-tag:
+    name: Backfill nested Go module tag
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' && inputs.root_tag != ''
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout release tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.root_tag }}
+          fetch-depth: 0
+
+      - name: Publish matching nested module tag
+        env:
+          ROOT_TAG: ${{ inputs.root_tag }}
+        run: |
+          set -euo pipefail
+          case "${ROOT_TAG}" in
+            v[0-9]*) ;;
+            *) echo "root_tag must be a semantic root tag such as v1.7.1" >&2; exit 1 ;;
+          esac
+
+          test "$(head -n 1 pkg/outbox/go.mod)" = "module github.com/petretiandrea/outbox-go/pkg/outbox"
+
+          nested_tag="pkg/outbox/${ROOT_TAG}"
+          release_commit="$(git rev-parse HEAD)"
+          if git ls-remote --exit-code --tags origin "refs/tags/${nested_tag}" >/dev/null 2>&1; then
+            remote_commit="$(git ls-remote origin "refs/tags/${nested_tag}^{}" | awk '{print $1}')"
+            if [ -z "${remote_commit}" ]; then
+              remote_commit="$(git ls-remote --refs origin "refs/tags/${nested_tag}" | awk '{print $1}')"
+            fi
+            test "${remote_commit}" = "${release_commit}"
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "${nested_tag}" "${release_commit}" -m "Release ${nested_tag}"
+          git push origin "refs/tags/${nested_tag}"

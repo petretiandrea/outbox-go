@@ -18,6 +18,10 @@ Applications that create business events can write messages to the PostgreSQL ou
 go get github.com/petretiandrea/outbox-go/pkg/outbox
 ```
 
+### Versioning
+
+The forwarder and publisher library are separate Go modules in this repository. Root releases use tags such as `v1.7.1`; publisher-library releases use the matching nested-module tag, for example `pkg/outbox/v1.7.1`. The release workflow publishes both tags together. To backfill a previously published root release, run the **Build outbox forwarder image** workflow manually and provide its root tag.
+
 Import the core package and the PostgreSQL publisher:
 
 ```go
