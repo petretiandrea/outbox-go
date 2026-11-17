@@ -15,6 +15,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 env:
   IMAGE_NAME: ${{ secrets.DOCKERHUB_USERNAME }}/outbox-forwarder
   TARGET_PLATFORMS: linux/arm64,linux/amd64
@@ -28,9 +32,6 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -53,7 +54,7 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
-          platforms: ${{ env.TARGET_PLATFORMS }}
+          platforms: linux/amd64
 
   release-dry-run:
     name: Resolve semantic release
@@ -98,6 +99,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # The final alpine stage runs a short RUN per target platform; the Go build itself is cross-compiled.
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
 
@@ -166,29 +168,9 @@ jobs:
 
       - name: Tag nested Go module
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PUSH_REMOTE: https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git
           RELEASE_VERSION: ${{ needs.release-dry-run.outputs.version }}
-        run: |
-          set -euo pipefail
-          root_tag="v${RELEASE_VERSION}"
-          nested_tag="pkg/outbox/${root_tag}"
-          release_commit="$(git rev-list -n 1 "${root_tag}")"
-
-          test "$(git show "${release_commit}:pkg/outbox/go.mod" | head -n 1)" = "module github.com/petretiandrea/outbox-go/pkg/outbox"
-
-          if git ls-remote --exit-code --tags origin "refs/tags/${nested_tag}" >/dev/null 2>&1; then
-            remote_commit="$(git ls-remote origin "refs/tags/${nested_tag}^{}" | awk '{print $1}')"
-            if [ -z "${remote_commit}" ]; then
-              remote_commit="$(git ls-remote --refs origin "refs/tags/${nested_tag}" | awk '{print $1}')"
-            fi
-            test "${remote_commit}" = "${release_commit}"
-            exit 0
-          fi
-
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git tag -a "${nested_tag}" "${release_commit}" -m "Release ${nested_tag}"
-          git push "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "refs/tags/${nested_tag}"
+        run: .github/scripts/tag-nested-module.sh "v${RELEASE_VERSION}"
 
   backfill-nested-module-tag:
     name: Backfill nested Go module tag
@@ -207,27 +189,4 @@ jobs:
       - name: Publish matching nested module tag
         env:
           ROOT_TAG: ${{ inputs.root_tag }}
-        run: |
-          set -euo pipefail
-          case "${ROOT_TAG}" in
-            v[0-9]*) ;;
-            *) echo "root_tag must be a semantic root tag such as v1.7.1" >&2; exit 1 ;;
-          esac
-
-          test "$(head -n 1 pkg/outbox/go.mod)" = "module github.com/petretiandrea/outbox-go/pkg/outbox"
-
-          nested_tag="pkg/outbox/${ROOT_TAG}"
-          release_commit="$(git rev-parse HEAD)"
-          if git ls-remote --exit-code --tags origin "refs/tags/${nested_tag}" >/dev/null 2>&1; then
-            remote_commit="$(git ls-remote origin "refs/tags/${nested_tag}^{}" | awk '{print $1}')"
-            if [ -z "${remote_commit}" ]; then
-              remote_commit="$(git ls-remote --refs origin "refs/tags/${nested_tag}" | awk '{print $1}')"
-            fi
-            test "${remote_commit}" = "${release_commit}"
-            exit 0
-          fi
-
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git tag -a "${nested_tag}" "${release_commit}" -m "Release ${nested_tag}"
-          git push origin "refs/tags/${nested_tag}"
+        run: .github/scripts/tag-nested-module.sh "${ROOT_TAG}"
