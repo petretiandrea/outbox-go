@@ -1,0 +1,38 @@
+name: Trivy security scan
+
+on:
+  pull_request:
+    paths-ignore:
+      - '**.md'
+  schedule:
+    - cron: '0 3 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: trivy-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  trivy:
+    uses: petretiandrea/github-actions/.github/workflows/trivy.yml@v1
+    with:
+      scan-ref: .
+
+  notify:
+    needs: trivy
+    if: always() && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: petretiandrea/github-actions/telegram-notify@v1
+        with:
+          bot-token: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          chat-id: ${{ vars.TELEGRAM_CHAT_ID }}
+          thread-id: ${{ vars.TELEGRAM_THREAD_ID }}
+          message: >-
+            ${{ needs.trivy.outputs.outcome == 'success'
+            && format('🔐 <b>Trivy</b> {0}: {1} findings ({2} critical)', github.repository, needs.trivy.outputs.total, needs.trivy.outputs.critical)
+            || format('⚠️ <b>Trivy</b> {0}: scan did not complete', github.repository) }}
