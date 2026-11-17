@@ -32,6 +32,59 @@
         "major"
       ],
       "dependencyDashboardApproval": true
+    },
+    {
+      "matchManagers": [
+        "gomod"
+      ],
+      "matchFileNames": [
+        "go.mod"
+      ],
+      "matchUpdateTypes": [
+        "minor",
+        "patch"
+      ],
+      "groupName": "go deps (root)"
+    },
+    {
+      "matchManagers": [
+        "gomod"
+      ],
+      "matchFileNames": [
+        "pkg/outbox/go.mod"
+      ],
+      "matchUpdateTypes": [
+        "minor",
+        "patch"
+      ],
+      "groupName": "go deps (pkg/outbox)"
+    },
+    {
+      "matchManagers": [
+        "dockerfile",
+        "docker-compose"
+      ],
+      "matchUpdateTypes": [
+        "minor",
+        "patch",
+        "digest",
+        "pin",
+        "pinDigest"
+      ],
+      "groupName": "docker images"
+    },
+    {
+      "matchManagers": [
+        "github-actions"
+      ],
+      "matchUpdateTypes": [
+        "minor",
+        "patch",
+        "digest",
+        "pin",
+        "pinDigest"
+      ],
+      "groupName": "github actions"
     }
   ]
 }
