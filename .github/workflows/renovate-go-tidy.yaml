@@ -1,0 +1,49 @@
+name: Renovate Go tidy
+
+on:
+  pull_request_target:
+    types: [opened, reopened, synchronize]
+    paths:
+      - "**/go.mod"
+      - "**/go.sum"
+
+permissions:
+  contents: write
+
+jobs:
+  tidy:
+    if: >-
+      github.actor == 'renovate[bot]' &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout PR head
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: true
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Tidy Go modules
+        run: |
+          find . -name go.mod -not -path '*/vendor/*' -print0 |
+            while IFS= read -r -d '' mod; do
+              (cd "$(dirname "$mod")" && go mod tidy)
+            done
+
+      - name: Commit and push
+        env:
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+        run: |
+          git add -- '*go.mod' '*go.sum'
+          if git diff --cached --quiet; then
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "chore(deps): tidy Go modules"
+          git push origin "HEAD:${HEAD_REF}"
