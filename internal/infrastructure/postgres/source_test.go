@@ -302,6 +302,8 @@ func (r *fakeRows) CommandTag() pgconn.CommandTag { return pgconn.NewCommandTag(
 
 func (r *fakeRows) FieldDescriptions() []pgconn.FieldDescription { return nil }
 
+func (r *fakeRows) TypeMap() *pgtype.Map { return pgtype.NewMap() }
+
 func (r *fakeRows) Next() bool {
 	if r.idx >= len(r.records) {
 		return false
