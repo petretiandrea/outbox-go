@@ -41,6 +41,9 @@ Minimal example with a `pgxpool.Pool`:
 func publishOrderCreated(ctx context.Context, pool *pgxpool.Pool) error {
 	publisher, err := outboxpostgres.NewPublisher(pool, outboxpostgres.PublisherConfig{
 		TableName: "outbox_messages",
+		// Optional. Accepts `table` or `schema.table`; components may be double-quoted
+		// (e.g. `"Public"."MyOutbox"`). Unquoted names are lower-cased as in PostgreSQL;
+		// malformed names are rejected by NewPublisher.
 	})
 	if err != nil {
 		return err
