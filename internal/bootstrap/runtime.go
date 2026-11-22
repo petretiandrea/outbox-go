@@ -3,11 +3,9 @@ package bootstrap
 import (
 	"context"
 	"errors"
-	"strings"
 
 	"github.com/petretiandrea/outbox-go/internal/config"
 	"github.com/petretiandrea/outbox-go/internal/domain"
-	"github.com/petretiandrea/outbox-go/pkg/outbox"
 )
 
 type Runtime struct {
@@ -31,9 +29,8 @@ func NewRuntimeWithFactories(config config.ServiceConfig, sourceFactory *SourceF
 	}
 
 	processor, err := domain.NewOutboxProcessor(domain.OutboxProcessorConfig{
-		Source:            source,
-		Publishers:        publishers,
-		DeadLetterChannel: outbox.Channel(strings.TrimSpace(config.DeadLetterChannel)),
+		Source:     source,
+		Publishers: publishers,
 	})
 	if err != nil {
 		for _, publisher := range publishers {

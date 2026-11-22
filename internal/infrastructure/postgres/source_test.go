@@ -473,8 +473,6 @@ type rowRecord struct {
 	metadata    []byte
 	occurredAt  time.Time
 	attempts    int32
-	failedAt    *time.Time
-	lastError   string
 }
 
 type fakeRows struct {
@@ -513,12 +511,6 @@ func (r *fakeRows) Scan(dest ...any) error {
 	*(dest[4].(*[]byte)) = record.metadata
 	*(dest[5].(*pgtype.Timestamptz)) = pgtype.Timestamptz{Time: record.occurredAt, Valid: true}
 	*(dest[6].(*int32)) = record.attempts
-	if record.failedAt != nil {
-		*(dest[7].(*pgtype.Timestamptz)) = pgtype.Timestamptz{Time: *record.failedAt, Valid: true}
-	}
-	if record.lastError != "" {
-		*(dest[8].(*pgtype.Text)) = pgtype.Text{String: record.lastError, Valid: true}
-	}
 	return nil
 }
 
@@ -529,155 +521,60 @@ func (r *fakeRows) RawValues() [][]byte { return nil }
 func (r *fakeRows) Conn() *pgx.Conn { return nil }
 
 type recordingMetrics struct {
-	deadLettered, retried int
+	deadLettered int
 }
 
 func (m *recordingMetrics) DeadLettered(count int) { m.deadLettered += count }
-func (m *recordingMetrics) DeadLetterRetried(c int) { m.retried += c }
-func (m *recordingMetrics) Snapshot(Stats) {}
+func (m *recordingMetrics) Snapshot(Stats)         {}
 
-func poisonBatch() claimedBatch {
-	return claimedBatch{
-		claimToken: "claim-1",
-		messages:   []outbox.Message{{ID: "ok", Channel: "orders"}, {ID: "poison", Channel: "orders", Payload: outbox.Payload("p")}},
-		attempts:   map[string]int32{"ok": 1, "poison": 2},
-	}
-}
-
-func poisonFailure() error {
-	return &domain.BatchError{Failures: []domain.MessageFailure{{ID: "poison", Err: domain.Permanent(errors.New("rejected by broker"))}}}
-}
-
-func TestSettlePublishesPoisonToDeadLetterQueueBeforeMarkingIt(t *testing.T) {
+func TestSettleReportsDeadLetteredCountAndKeepsHealthyRowsFlowing(t *testing.T) {
 	executor := &fakeExecutor{commandTag: pgconn.NewCommandTag("UPDATE 1")}
 	source := newTestSource(executor)
 	metrics := &recordingMetrics{}
 	source.metrics = metrics
-
-	var letters []domain.DeadLetter
-	var callsAtPublish []string
-	source.SetDeadLetterHandler(func(_ context.Context, l ...domain.DeadLetter) error {
-		for _, call := range executor.execs {
-			callsAtPublish = append(callsAtPublish, call.sql[:strings.Index(call.sql, "\n")])
-		}
-		letters = append(letters, l...)
-		return nil
-	})
-
-	source.settle(context.Background(), poisonBatch(), poisonFailure())
-
-	if len(letters) != 1 || letters[0].Message.ID != "poison" || letters[0].Attempts != 2 || !strings.Contains(letters[0].LastError, "rejected by broker") {
-		t.Fatalf("expected the poison message with failure details on the DLQ, got %+v", letters)
+	claimed := claimedBatch{
+		claimToken: "claim-1",
+		messages:   []outbox.Message{{ID: "ok"}, {ID: "poison"}},
+		attempts:   map[string]int32{"ok": 1, "poison": 2},
 	}
-	if len(execsContaining(executor, "-- name: ParkClaimedOutboxMessages")) != 0 {
-		t.Fatal("with a DLQ the row must not be parked directly")
+	handlerErr := &domain.BatchError{Failures: []domain.MessageFailure{
+		{ID: "poison", Err: domain.Permanent(errors.New("rejected by broker"))},
+	}}
+
+	source.settle(context.Background(), claimed, handlerErr)
+
+	deadLettered := execsContaining(executor, "-- name: ParkClaimedOutboxMessages")
+	if len(deadLettered) != 1 || !reflect.DeepEqual(deadLettered[0].args[0], []string{"poison"}) {
+		t.Fatalf("expected the poison row to be dead-lettered in the table, got %+v", deadLettered)
 	}
-	if got := strings.Join(callsAtPublish, ","); !strings.Contains(got, "MarkFailedOutboxMessages") || strings.Contains(got, "CompleteDeadLetterOutboxMessages") {
-		t.Fatalf("expected the failure to be recorded before, and completion only after, the DLQ publish; saw %q before publish", got)
-	}
-	completes := execsContaining(executor, "-- name: CompleteDeadLetterOutboxMessages")
-	if len(completes) != 1 || !reflect.DeepEqual(completes[0].args[2], []string{"poison"}) {
-		t.Fatalf("expected the acknowledged row to be marked dead-lettered, got %+v", completes)
+	if errs := deadLettered[0].args[1].([]string); !strings.Contains(errs[0], "rejected by broker") {
+		t.Fatalf("expected the failure reason to be stored with the row, got %v", errs)
 	}
 	deletes := execsContaining(executor, "DELETE FROM outbox_messages")
 	if len(deletes) != 1 || !reflect.DeepEqual(deletes[0].args[2], []string{"ok"}) {
-		t.Fatalf("healthy messages must still be deleted, got %+v", deletes)
+		t.Fatalf("healthy rows must still be deleted, got %+v", deletes)
 	}
-	if metrics.deadLettered != 1 || metrics.retried != 0 {
-		t.Fatalf("unexpected metrics: %+v", metrics)
+	if metrics.deadLettered != 1 {
+		t.Fatalf("expected one dead-lettered row to be reported, got %d", metrics.deadLettered)
 	}
 }
 
-func TestSettleRetriesDeadLetterPublishWithBackoffAndKeepsTheRow(t *testing.T) {
-	executor := &fakeExecutor{commandTag: pgconn.NewCommandTag("UPDATE 1")}
+func TestSettleDoesNotReportDeadLetteredWhenClaimWasLost(t *testing.T) {
+	executor := &fakeExecutor{commandTag: pgconn.NewCommandTag("UPDATE 0")}
 	source := newTestSource(executor)
 	metrics := &recordingMetrics{}
 	source.metrics = metrics
-	source.SetDeadLetterHandler(func(context.Context, ...domain.DeadLetter) error { return errors.New("dlq broker down") })
+	claimed := claimedBatch{
+		claimToken: "claim-1",
+		messages:   []outbox.Message{{ID: "poison"}},
+		attempts:   map[string]int32{"poison": 1},
+	}
 
-	batch := poisonBatch()
-	batch.messages = append(batch.messages, outbox.Message{ID: "flaky", Channel: "orders"})
-	batch.attempts["flaky"] = 1
-	failures := &domain.BatchError{Failures: []domain.MessageFailure{
+	source.settle(context.Background(), claimed, &domain.BatchError{Failures: []domain.MessageFailure{
 		{ID: "poison", Err: domain.Permanent(errors.New("rejected by broker"))},
-		{ID: "flaky", Err: errors.New("broker unavailable")},
-	}}
+	}})
 
-	source.settle(context.Background(), batch, failures)
-
-	if len(execsContaining(executor, "-- name: CompleteDeadLetterOutboxMessages")) != 0 {
-		t.Fatal("a row must not be marked dead-lettered when the DLQ publish failed")
-	}
-	releases := execsContaining(executor, "-- name: ReleaseDeadLetterOutboxMessages")
-	if len(releases) != 1 || !reflect.DeepEqual(releases[0].args[4], []string{"poison"}) {
-		t.Fatalf("expected the DLQ publish to be retried with backoff, got %+v", releases)
-	}
-	if len(execsContaining(executor, "next_attempt_at = CASE")) != 1 {
-		t.Fatal("other rows must keep flowing: the transient failure is still released with backoff")
-	}
-	if len(execsContaining(executor, "DELETE FROM outbox_messages")) != 1 {
-		t.Fatal("healthy rows must still be deleted when the DLQ is down")
-	}
-	if metrics.retried != 1 || metrics.deadLettered != 0 {
-		t.Fatalf("unexpected metrics: %+v", metrics)
-	}
-}
-
-func TestSettleDoesNotPublishToDeadLetterQueueWhenFailureCannotBeRecorded(t *testing.T) {
-	executor := &fakeExecutor{commandTag: pgconn.NewCommandTag("UPDATE 0")}
-	source := newTestSource(executor)
-	called := false
-	source.SetDeadLetterHandler(func(context.Context, ...domain.DeadLetter) error { called = true; return nil })
-
-	source.settle(context.Background(), poisonBatch(), poisonFailure())
-
-	if called {
-		t.Fatal("a lost claim must not publish to the DLQ")
-	}
-}
-
-func TestRestartInTheMiddleOfDeadLetteringResumesAtTheDeadLetterStep(t *testing.T) {
-	failedAt := time.Date(2026, 11, 22, 10, 0, 0, 0, time.UTC)
-	// The row was marked failed, the DLQ publish may or may not have happened,
-	// then the process crashed. After the lease expires another claim sees it.
-	crashed := rowRecord{id: "poison", channel: "orders", payload: []byte("p"), occurredAt: time.Now(), attempts: 3, failedAt: &failedAt, lastError: "rejected by broker"}
-	executor := &fakeExecutor{commandTag: pgconn.NewCommandTag("UPDATE 1"), rows: rows(crashed, record("healthy", 1))}
-	source := newTestSource(executor)
-	var letters []domain.DeadLetter
-	source.SetDeadLetterHandler(func(_ context.Context, l ...domain.DeadLetter) error { letters = append(letters, l...); return nil })
-
-	claimed, err := source.claimBatch(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if executor.queryArgs[0] != true {
-		t.Fatalf("expected the claim to include failed rows when a DLQ is configured, got %v", executor.queryArgs[0])
-	}
-	if len(claimed.messages) != 1 || claimed.messages[0].ID != "healthy" || len(claimed.deadLetters) != 1 {
-		t.Fatalf("expected the failed row to bypass the normal publish path, got %+v", claimed)
-	}
-
-	source.settle(context.Background(), claimed, nil)
-
-	if len(letters) != 1 || letters[0].Message.ID != "poison" || letters[0].Attempts != 3 || letters[0].LastError != "rejected by broker" || !letters[0].FailedAt.Equal(failedAt) {
-		t.Fatalf("expected the original failure to be replayed to the DLQ, got %+v", letters)
-	}
-	if len(execsContaining(executor, "-- name: MarkFailedOutboxMessages")) != 0 {
-		t.Fatal("the failure is already recorded and must not be overwritten")
-	}
-	completes := execsContaining(executor, "-- name: CompleteDeadLetterOutboxMessages")
-	if len(completes) != 1 || !reflect.DeepEqual(completes[0].args[2], []string{"poison"}) {
-		t.Fatalf("expected the row to be completed after the DLQ acknowledged it, got %+v", completes)
-	}
-}
-
-func TestClaimSkipsFailedRowsWithoutDeadLetterQueue(t *testing.T) {
-	executor := &fakeExecutor{}
-	source := newTestSource(executor)
-	if _, err := source.claimBatch(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	if executor.queryArgs[0] != false {
-		t.Fatalf("without a DLQ, failed rows must stay parked, got %v", executor.queryArgs[0])
+	if metrics.deadLettered != 0 {
+		t.Fatalf("a lost claim must not be reported as dead-lettered, got %d", metrics.deadLettered)
 	}
 }

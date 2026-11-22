@@ -12,15 +12,11 @@ import (
 type OutboxProcessorConfig struct {
 	Source     Source
 	Publishers map[outbox.Channel]outbox.Publisher
-	// DeadLetterChannel optionally names a configured channel that receives
-	// messages that cannot be published. The source must be a DeadLetterSource.
-	DeadLetterChannel outbox.Channel
 }
 
 type OutboxProcessor struct {
-	source            Source
-	publishers        map[outbox.Channel]outbox.Publisher
-	deadLetterChannel outbox.Channel
+	source     Source
+	publishers map[outbox.Channel]outbox.Publisher
 }
 
 func NewOutboxProcessor(config OutboxProcessorConfig) (*OutboxProcessor, error) {
@@ -42,24 +38,7 @@ func NewOutboxProcessor(config OutboxProcessorConfig) (*OutboxProcessor, error) 
 		publishers[channel] = publisher
 	}
 
-	processor := &OutboxProcessor{
-		source:            config.Source,
-		publishers:        publishers,
-		deadLetterChannel: outbox.Channel(strings.TrimSpace(string(config.DeadLetterChannel))),
-	}
-
-	if processor.deadLetterChannel != "" {
-		dlqSource, ok := config.Source.(DeadLetterSource)
-		if !ok {
-			return nil, errors.New("dead-letter channel is configured but the source does not support dead-lettering")
-		}
-		if _, ok := publishers[processor.deadLetterChannel]; !ok {
-			return nil, fmt.Errorf("dead-letter channel %q is not a configured channel", processor.deadLetterChannel)
-		}
-		dlqSource.SetDeadLetterHandler(processor.deadLetter)
-	}
-
-	return processor, nil
+	return &OutboxProcessor{source: config.Source, publishers: publishers}, nil
 }
 
 func (p *OutboxProcessor) Process(ctx context.Context) error {
@@ -129,22 +108,4 @@ func (p *OutboxProcessor) handleMessages(ctx context.Context, messages ...*outbo
 		return nil
 	}
 	return &BatchError{Failures: failures}
-}
-
-// deadLetter publishes messages that could not be delivered to the dead-letter
-// channel. It returns nil only when the publisher acknowledged all of them.
-func (p *OutboxProcessor) deadLetter(ctx context.Context, letters ...DeadLetter) error {
-	if len(letters) == 0 {
-		return nil
-	}
-
-	messages := make([]outbox.Message, 0, len(letters))
-	for _, letter := range letters {
-		messages = append(messages, letter.toMessage(p.deadLetterChannel))
-	}
-
-	if err := p.publishers[p.deadLetterChannel].Publish(ctx, messages...); err != nil {
-		return fmt.Errorf("publish to dead-letter channel %q: %w", p.deadLetterChannel, err)
-	}
-	return nil
 }

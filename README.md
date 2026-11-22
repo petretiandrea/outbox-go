@@ -132,91 +132,44 @@ A failure never stops the forwarder, and one bad row never blocks healthy rows:
 - **Permanent failures** (invalid message, unknown channel, metadata that cannot be decoded) are dead-lettered immediately. A transient failure is dead-lettered after `max_attempts` claims.
 - On shutdown, unfinished rows are released immediately and the interrupted attempt is not counted.
 
-Because rows are retried out of order after a failure, ordering across retries is not guaranteed (see below). Run with `initialize_schema: true` or apply the migrations up to `000005`. Migration `000005` renames `quarantined_at` (introduced by `000004`) to `dead_lettered_at` and adds `failed_at` and `dead_letter_attempts`.
+Because rows are retried out of order after a failure, ordering across retries is not guaranteed (see below). Run with `initialize_schema: true` or apply the migrations up to `000005`. Migration `000005` renames `quarantined_at` (introduced by `000004`) to `dead_lettered_at`.
 
-#### Without a dead-letter queue
+#### Dead-letter queue
 
-A dead-lettered row stays in `outbox_messages` with `failed_at`, `dead_lettered_at`, `attempts` and `last_error` set, and is no longer claimed. Nothing is published and nothing alerts an operator except the log and metrics hooks below. Inspect them with:
+The dead-letter queue (DLQ) is the `outbox_messages` table itself, so it adds no dependency on a broker and keeps working when every broker is down. A dead-lettered row stays in the table with `dead_lettered_at`, `attempts` and `last_error` set, together with its original channel, payload, affinity key and metadata. It is no longer claimed, and healthy rows keep flowing. Dead-lettering is a single database update, so a row is never lost or stuck half-way. Delivery of the original messages stays at-least-once.
+
+Inspect dead-lettered rows with:
 
 ```sql
-SELECT id, channel, attempts, last_error FROM outbox_messages WHERE dead_lettered_at IS NOT NULL;
+SELECT id, channel, attempts, last_error, dead_lettered_at
+FROM outbox_messages
+WHERE dead_lettered_at IS NOT NULL
+ORDER BY dead_lettered_at;
 ```
 
-After fixing the cause (for example configuring the missing channel), requeue a row with:
+#### Replaying dead-lettered messages
+
+After fixing the cause (for example configuring the missing channel), requeue rows by clearing the dead-letter state:
 
 ```sql
 UPDATE outbox_messages
-SET dead_lettered_at = NULL, failed_at = NULL, attempts = 0, dead_letter_attempts = 0, next_attempt_at = NULL
-WHERE id = '...';
+SET dead_lettered_at = NULL, attempts = 0, next_attempt_at = NULL, last_error = NULL
+WHERE id = '...';          -- or WHERE channel = '...' AND dead_lettered_at IS NOT NULL
 ```
 
-#### Dead-letter queue (DLQ)
+If the payload itself is wrong, fix it in the same `UPDATE`, or delete the row. A replayed message is delivered at-least-once, may arrive out of order relative to newer messages, and is dead-lettered again if it fails again. Consumers must deduplicate on `Message.ID`.
 
-Set the optional top-level `dlq_channel` to the name of a configured channel to publish dead-lettered messages there instead of only parking them:
-
-```yaml
-dlq_channel: orders.dead-letter
-
-channels:
-  - name: orders.created
-    publisher: { type: rabbitmq, data: { url: amqp://..., exchange: outbox.events, routing_key: orders.created } }
-  - name: orders.dead-letter
-    publisher: { type: kafka, data: { brokers: [kafka:9092], topic: outbox.dead-letter } }
-```
-
-The DLQ channel uses the normal publisher of that channel, so it may live on a different broker. Startup fails if `dlq_channel` does not name a configured channel. Messages whose own channel is the DLQ channel are retried like any other message, and if they dead-letter they have nowhere else to go: use a channel that outbox messages are not written to.
-
-A dead-lettered message is published with the original `id`, payload, affinity key and metadata, plus these metadata entries (they override same-named keys):
-
-| Key | Value |
-| --- | --- |
-| `x-outbox-original-channel` | Channel the message was written to. |
-| `x-outbox-message-id` | Original message ID (also the message `ID`). |
-| `x-outbox-attempts` | Number of publish attempts. |
-| `x-outbox-last-error` | Last failure reason (truncated to 2000 bytes). |
-| `x-outbox-failed-at` | RFC 3339 time the message was dead-lettered. |
-
-How a row moves through the DLQ:
-
-1. The failure is recorded (`failed_at`, `last_error`) while the row stays claimed.
-2. The message is published to the DLQ channel.
-3. Only after the DLQ publisher acknowledges it, `dead_lettered_at` is set and the row leaves the claim queue.
-4. If the DLQ publish fails, the row is released and retried with exponential backoff (`retry_backoff` up to `max_retry_backoff`, counted in `dead_letter_attempts`) without any attempt limit. Rows with `failed_at` set never go back to their original channel and never block other rows.
-5. If the forwarder crashes at any point, the row is claimed again after the lease expires and resumes at step 2.
-
-Delivery to the DLQ is at-least-once: a crash after the DLQ acknowledged a message but before step 3 publishes it again. Deduplicate on `x-outbox-message-id`.
-
-Rows remain in `outbox_messages` after they were dead-lettered (`dead_lettered_at IS NOT NULL`). Delete them once you no longer need them. Rows parked before `dlq_channel` was configured stay parked; replay them with the SQL above or delete them.
-
-#### Replaying messages from the DLQ
-
-Replay is performed by whoever owns the DLQ, after fixing the cause:
-
-1. Consume the message from the DLQ.
-2. Re-insert it into the outbox with the publisher library, using the original channel and a new or the original ID. Take the channel from `x-outbox-original-channel`, and drop the `x-outbox-*` metadata entries. Reusing the original ID keeps consumer-side deduplication working; use a new ID only if the consumer already recorded the original as processed and the replay must be handled again.
-3. Acknowledge the DLQ message.
-
-```go
-msg := outbox.NewMessage(
-	dlq.Metadata["x-outbox-message-id"],
-	outbox.Channel(dlq.Metadata["x-outbox-original-channel"]),
-	dlq.AffinityKey, dlq.Payload, withoutOutboxMetadata(dlq.Metadata),
-)
-err := publisher.Publish(ctx, msg)
-```
-
-A replayed message reaches the original channel at-least-once and may arrive out of order relative to newer messages. Messages that fail again are dead-lettered again.
+Dead-lettered rows are kept until you delete them, for example `DELETE FROM outbox_messages WHERE dead_lettered_at < now() - interval '30 days'`.
 
 #### Metrics and alerting
 
-The forwarder logs `outbox message dead-lettered` at error level for every message and reports these metrics through the `Metrics` interface of the PostgreSQL source (default: structured `outbox metric` log lines, wire your own implementation for Prometheus or OpenTelemetry when embedding the source):
+The forwarder logs `outbox message dead-lettered` at error level for every row. The PostgreSQL source also reports metrics through its `Metrics` interface. By default they are structured `outbox metric` log lines; when embedding the source, set `SourceConfig.Metrics` to an implementation that feeds Prometheus, OpenTelemetry or any other system.
 
 | Metric | Meaning |
 | --- | --- |
-| `outbox_dead_lettered_total` | Messages acknowledged by the DLQ, or parked when no DLQ is configured. |
-| `outbox_dead_letter_retries_total` | Messages whose DLQ publish failed and was scheduled for retry. |
+| `outbox_dead_lettered_total` | Rows dead-lettered by this forwarder (a counter increment per event). |
+| `dead_lettered` | Rows currently dead-lettered in the table, sampled every 15s. Alert when it is above zero. |
 | `oldest_claimable_age_seconds` | Age of the oldest row that could be claimed now, sampled every 15s. Alert when it keeps growing. |
-| `dead_lettered`, `pending_dead_letter` | Rows currently dead-lettered, and failed rows still waiting for the DLQ. Alert when `pending_dead_letter` does not drain. |
 
 ### Ordering
 

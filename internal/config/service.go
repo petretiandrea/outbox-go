@@ -3,9 +3,6 @@ package config
 type ServiceConfig struct {
 	Source   SourceConfig    `koanf:"source" yaml:"source" json:"source"`
 	Channels []ChannelConfig `koanf:"channels" yaml:"channels" json:"channels"`
-	// DeadLetterChannel optionally names one of Channels. Messages that fail
-	// permanently are published there with failure metadata.
-	DeadLetterChannel string `koanf:"dlq_channel" yaml:"dlq_channel" json:"dlq_channel"`
 }
 
 type SourceConfig struct {

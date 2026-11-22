@@ -16,31 +16,29 @@ WITH candidate AS (
     SELECT id
     FROM outbox_messages
     WHERE dead_lettered_at IS NULL
-      AND (failed_at IS NULL OR $1::boolean)
       AND (claimed_until IS NULL OR claimed_until <= now())
       AND (next_attempt_at IS NULL OR next_attempt_at <= now())
     ORDER BY occurred_at ASC, id ASC
-    LIMIT $2
+    LIMIT $1
     FOR UPDATE SKIP LOCKED
 ),
 claimed AS (
     UPDATE outbox_messages AS outbox
-    SET claimed_by = $3,
-        claim_token = $4,
-        claimed_until = now() + ($5::bigint * interval '1 millisecond'),
-        attempts = CASE WHEN outbox.failed_at IS NULL THEN outbox.attempts + 1 ELSE outbox.attempts END,
-        last_error = CASE WHEN outbox.failed_at IS NULL THEN NULL ELSE outbox.last_error END
+    SET claimed_by = $2,
+        claim_token = $3,
+        claimed_until = now() + ($4::bigint * interval '1 millisecond'),
+        attempts = outbox.attempts + 1,
+        last_error = NULL
     FROM candidate
     WHERE outbox.id = candidate.id
-    RETURNING outbox.id, outbox.channel, outbox.affinity_key, outbox.payload, outbox.metadata, outbox.occurred_at, outbox.attempts, outbox.failed_at, outbox.last_error, outbox.dead_letter_attempts
+    RETURNING outbox.id, outbox.channel, outbox.affinity_key, outbox.payload, outbox.metadata, outbox.occurred_at, outbox.attempts
 )
-SELECT id, channel, affinity_key, payload, metadata, occurred_at, attempts, failed_at, last_error, dead_letter_attempts
+SELECT id, channel, affinity_key, payload, metadata, occurred_at, attempts
 FROM claimed
 ORDER BY occurred_at ASC, id ASC
 `
 
 type ClaimOutboxMessagesParams struct {
-	DeadLetterEnabled      bool        `json:"dead_letter_enabled"`
 	BatchSize              int32       `json:"batch_size"`
 	ClaimedBy              pgtype.Text `json:"claimed_by"`
 	ClaimToken             pgtype.Text `json:"claim_token"`
@@ -48,20 +46,17 @@ type ClaimOutboxMessagesParams struct {
 }
 
 type ClaimOutboxMessagesRow struct {
-	ID                 string             `json:"id"`
-	Channel            string             `json:"channel"`
-	AffinityKey        pgtype.Text        `json:"affinity_key"`
-	Payload            []byte             `json:"payload"`
-	Metadata           []byte             `json:"metadata"`
-	OccurredAt         pgtype.Timestamptz `json:"occurred_at"`
-	Attempts           int32              `json:"attempts"`
-	FailedAt           pgtype.Timestamptz `json:"failed_at"`
-	LastError          pgtype.Text        `json:"last_error"`
-	DeadLetterAttempts int32              `json:"dead_letter_attempts"`
+	ID          string             `json:"id"`
+	Channel     string             `json:"channel"`
+	AffinityKey pgtype.Text        `json:"affinity_key"`
+	Payload     []byte             `json:"payload"`
+	Metadata    []byte             `json:"metadata"`
+	OccurredAt  pgtype.Timestamptz `json:"occurred_at"`
+	Attempts    int32              `json:"attempts"`
 }
 
 func (q *Queries) ClaimOutboxMessages(ctx context.Context, arg ClaimOutboxMessagesParams) ([]ClaimOutboxMessagesRow, error) {
-	rows, err := q.db.Query(ctx, claimOutboxMessages, arg.DeadLetterEnabled, arg.BatchSize, arg.ClaimedBy, arg.ClaimToken, arg.ClaimLeaseMilliseconds)
+	rows, err := q.db.Query(ctx, claimOutboxMessages, arg.BatchSize, arg.ClaimedBy, arg.ClaimToken, arg.ClaimLeaseMilliseconds)
 	if err != nil {
 		return nil, err
 	}
@@ -77,9 +72,6 @@ func (q *Queries) ClaimOutboxMessages(ctx context.Context, arg ClaimOutboxMessag
 			&i.Metadata,
 			&i.OccurredAt,
 			&i.Attempts,
-			&i.FailedAt,
-			&i.LastError,
-			&i.DeadLetterAttempts,
 		); err != nil {
 			return nil, err
 		}
@@ -193,7 +185,6 @@ SET claimed_by = NULL,
     claim_token = NULL,
     claimed_until = NULL,
     next_attempt_at = NULL,
-    failed_at = COALESCE(outbox.failed_at, now()),
     dead_lettered_at = now(),
     last_error = failure.error
 FROM unnest($1::text[], $2::text[]) AS failure(id, error)
@@ -210,117 +201,15 @@ type ParkClaimedOutboxMessagesParams struct {
 	ClaimToken pgtype.Text `json:"claim_token"`
 }
 
-// Dead-letters poison rows when no DLQ is configured: they leave the claim
-// queue and stay in the table with last_error and attempts for inspection.
-// To replay one, clear dead_lettered_at and failed_at and reset attempts.
+// Dead-letters rows that failed permanently or exhausted max_attempts: they
+// leave the claim queue and stay in the table with last_error and attempts
+// for inspection. To replay one, clear dead_lettered_at and reset attempts.
 func (q *Queries) ParkClaimedOutboxMessages(ctx context.Context, arg ParkClaimedOutboxMessagesParams) (int64, error) {
 	result, err := q.db.Exec(ctx, parkClaimedOutboxMessages,
 		arg.Ids,
 		arg.Errors,
 		arg.ClaimedBy,
 		arg.ClaimToken,
-	)
-	if err != nil {
-		return 0, err
-	}
-	return result.RowsAffected(), nil
-}
-
-const markFailedOutboxMessages = `-- name: MarkFailedOutboxMessages :execrows
-UPDATE outbox_messages AS outbox
-SET failed_at = COALESCE(outbox.failed_at, now()),
-    last_error = failure.error
-FROM unnest($1::text[], $2::text[]) AS failure(id, error)
-WHERE outbox.id = failure.id
-  AND outbox.claimed_by = $3
-  AND outbox.claim_token = $4
-  AND outbox.claimed_until > now()
-`
-
-type MarkFailedOutboxMessagesParams struct {
-	Ids        []string    `json:"ids"`
-	Errors     []string    `json:"errors"`
-	ClaimedBy  pgtype.Text `json:"claimed_by"`
-	ClaimToken pgtype.Text `json:"claim_token"`
-}
-
-// Durably records that a row failed permanently while keeping the claim, so
-// that a crash before the DLQ acknowledges it resumes at the DLQ step instead
-// of publishing to the original channel again.
-func (q *Queries) MarkFailedOutboxMessages(ctx context.Context, arg MarkFailedOutboxMessagesParams) (int64, error) {
-	result, err := q.db.Exec(ctx, markFailedOutboxMessages,
-		arg.Ids,
-		arg.Errors,
-		arg.ClaimedBy,
-		arg.ClaimToken,
-	)
-	if err != nil {
-		return 0, err
-	}
-	return result.RowsAffected(), nil
-}
-
-const completeDeadLetterOutboxMessages = `-- name: CompleteDeadLetterOutboxMessages :execrows
-UPDATE outbox_messages
-SET claimed_by = NULL,
-    claim_token = NULL,
-    claimed_until = NULL,
-    next_attempt_at = NULL,
-    dead_lettered_at = now()
-WHERE claimed_by = $1
-  AND claim_token = $2
-  AND claimed_until > now()
-  AND id = ANY($3::text[])
-`
-
-type CompleteDeadLetterOutboxMessagesParams struct {
-	ClaimedBy  pgtype.Text `json:"claimed_by"`
-	ClaimToken pgtype.Text `json:"claim_token"`
-	Ids        []string    `json:"ids"`
-}
-
-// Marks rows as dead-lettered. Called only after the DLQ acknowledged them.
-func (q *Queries) CompleteDeadLetterOutboxMessages(ctx context.Context, arg CompleteDeadLetterOutboxMessagesParams) (int64, error) {
-	result, err := q.db.Exec(ctx, completeDeadLetterOutboxMessages, arg.ClaimedBy, arg.ClaimToken, arg.Ids)
-	if err != nil {
-		return 0, err
-	}
-	return result.RowsAffected(), nil
-}
-
-const releaseDeadLetterOutboxMessages = `-- name: ReleaseDeadLetterOutboxMessages :execrows
-UPDATE outbox_messages
-SET claimed_by = NULL,
-    claim_token = NULL,
-    claimed_until = NULL,
-    dead_letter_attempts = dead_letter_attempts + 1,
-    next_attempt_at = now() + LEAST(
-        $1::bigint,
-        $2::bigint * power(2, LEAST(dead_letter_attempts, 30))::bigint
-    ) * interval '1 millisecond'
-WHERE claimed_by = $3
-  AND claim_token = $4
-  AND claimed_until > now()
-  AND id = ANY($5::text[])
-`
-
-type ReleaseDeadLetterOutboxMessagesParams struct {
-	MaxBackoffMilliseconds  int64       `json:"max_backoff_milliseconds"`
-	BaseBackoffMilliseconds int64       `json:"base_backoff_milliseconds"`
-	ClaimedBy               pgtype.Text `json:"claimed_by"`
-	ClaimToken              pgtype.Text `json:"claim_token"`
-	Ids                     []string    `json:"ids"`
-}
-
-// Returns rows whose DLQ publish failed to the queue with exponential backoff
-// based on dead_letter_attempts. last_error keeps the original failure.
-func (q *Queries) ReleaseDeadLetterOutboxMessages(ctx context.Context, arg ReleaseDeadLetterOutboxMessagesParams) (int64, error) {
-	result, err := q.db.Exec(ctx, releaseDeadLetterOutboxMessages,
-		arg.MaxBackoffMilliseconds,
-		arg.BaseBackoffMilliseconds,
-		arg.ClaimedBy,
-		arg.ClaimToken,
-		arg.Ids,
 	)
 	if err != nil {
 		return 0, err
@@ -335,15 +224,13 @@ SELECT
           AND (claimed_until IS NULL OR claimed_until <= now())
           AND (next_attempt_at IS NULL OR next_attempt_at <= now())
     ))), 0)::float8 AS oldest_claimable_age_seconds,
-    (count(*) FILTER (WHERE dead_lettered_at IS NOT NULL))::bigint AS dead_lettered_count,
-    (count(*) FILTER (WHERE failed_at IS NOT NULL AND dead_lettered_at IS NULL))::bigint AS pending_dead_letter_count
+    (count(*) FILTER (WHERE dead_lettered_at IS NOT NULL))::bigint AS dead_lettered_count
 FROM outbox_messages
 `
 
 type GetOutboxStatsRow struct {
 	OldestClaimableAgeSeconds float64 `json:"oldest_claimable_age_seconds"`
 	DeadLetteredCount         int64   `json:"dead_lettered_count"`
-	PendingDeadLetterCount    int64   `json:"pending_dead_letter_count"`
 }
 
 // Operational snapshot for alerting. oldest_claimable_age_seconds is the age of
@@ -351,6 +238,6 @@ type GetOutboxStatsRow struct {
 func (q *Queries) GetOutboxStats(ctx context.Context) (GetOutboxStatsRow, error) {
 	row := q.db.QueryRow(ctx, getOutboxStats)
 	var i GetOutboxStatsRow
-	err := row.Scan(&i.OldestClaimableAgeSeconds, &i.DeadLetteredCount, &i.PendingDeadLetterCount)
+	err := row.Scan(&i.OldestClaimableAgeSeconds, &i.DeadLetteredCount)
 	return i, err
 }
