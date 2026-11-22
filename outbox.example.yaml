@@ -18,7 +18,6 @@ channels:
         routing_key: orders.created
         content_type: application/json
         delivery_mode: 2
-        mandatory: false
         immediate: false
 
   - name: payments.completed
