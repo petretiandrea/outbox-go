@@ -132,7 +132,7 @@ A failure never stops the forwarder, and one bad row never blocks healthy rows:
 - **Permanent failures** (invalid message, unknown channel, metadata that cannot be decoded) are dead-lettered immediately. A transient failure is dead-lettered after `max_attempts` claims.
 - On shutdown, unfinished rows are released immediately and the interrupted attempt is not counted.
 
-Because rows are retried out of order after a failure, ordering across retries is not guaranteed (see below). Run with `initialize_schema: true` or apply the migrations up to `000005`. Migration `000005` renames `quarantined_at` (introduced by `000004`) to `dead_lettered_at`.
+Because rows are retried out of order after a failure, ordering across retries is not guaranteed (see below). Run with `initialize_schema: true` or apply migration `000004`, which adds `next_attempt_at` and `dead_lettered_at`.
 
 #### Dead-letter queue
 

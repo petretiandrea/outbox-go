@@ -227,7 +227,7 @@ func TestIntegrationDeadLetteredRowsCanBeReplayedWithSQL(t *testing.T) {
 	waitFor(t, "replayed row to be published", func() bool { return published.Load() == 1 })
 }
 
-func TestIntegrationMigrationRenamesQuarantinedRowsOfAnExistingDatabase(t *testing.T) {
+func TestIntegrationMigrationAddsDeadLetterColumnsToAnExistingDatabase(t *testing.T) {
 	dsn := freshSchema(t, integrationDSN(t))
 	db, err := sql.Open("pgx", dsn)
 	if err != nil {
@@ -246,25 +246,28 @@ func TestIntegrationMigrationRenamesQuarantinedRowsOfAnExistingDatabase(t *testi
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := migrator.Migrate(4); err != nil {
+	if err := migrator.Migrate(3); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.Exec(`INSERT INTO outbox_messages (id, channel, payload, occurred_at, quarantined_at, last_error, attempts) VALUES ('q', 'c', '\x7b7d', now(), now(), 'boom', 4)`); err != nil {
+	if _, err := db.Exec(`INSERT INTO outbox_messages (id, channel, payload, occurred_at) VALUES ('existing', 'c', '\x7b7d', now())`); err != nil {
 		t.Fatal(err)
 	}
 
 	if err := migrator.Up(); err != nil {
-		t.Fatalf("up to 000005: %v", err)
+		t.Fatalf("up to 000004: %v", err)
 	}
-	var lastError string
-	if err := db.QueryRow(`SELECT last_error FROM outbox_messages WHERE id = 'q' AND dead_lettered_at IS NOT NULL`).Scan(&lastError); err != nil || lastError != "boom" {
-		t.Fatalf("quarantined row must be dead-lettered after the migration: %v %q", err, lastError)
+	var deadLetteredAt, nextAttemptAt sql.NullTime
+	if err := db.QueryRow(`SELECT dead_lettered_at, next_attempt_at FROM outbox_messages WHERE id = 'existing'`).Scan(&deadLetteredAt, &nextAttemptAt); err != nil {
+		t.Fatalf("existing rows must stay claimable after the migration: %v", err)
+	}
+	if deadLetteredAt.Valid || nextAttemptAt.Valid {
+		t.Fatal("existing rows must not be dead-lettered or delayed by the migration")
 	}
 
 	if err := migrator.Steps(-1); err != nil {
-		t.Fatalf("down 000005: %v", err)
+		t.Fatalf("down 000004: %v", err)
 	}
-	if err := db.QueryRow(`SELECT last_error FROM outbox_messages WHERE id = 'q' AND quarantined_at IS NOT NULL`).Scan(&lastError); err != nil {
-		t.Fatalf("down migration must restore quarantined_at: %v", err)
+	if _, err := db.Exec(`SELECT dead_lettered_at FROM outbox_messages`); err == nil {
+		t.Fatal("down migration must drop dead_lettered_at")
 	}
 }
