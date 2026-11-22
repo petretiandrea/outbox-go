@@ -19,6 +19,9 @@ type FactoryConfig struct {
 	PollInterval     string `koanf:"poll_interval" yaml:"poll_interval" json:"poll_interval"`
 	ClaimLease       string `koanf:"claim_lease" yaml:"claim_lease" json:"claim_lease"`
 	ClaimOwner       string `koanf:"claim_owner" yaml:"claim_owner" json:"claim_owner"`
+	MaxAttempts      int    `koanf:"max_attempts" yaml:"max_attempts" json:"max_attempts"`
+	RetryBackoff     string `koanf:"retry_backoff" yaml:"retry_backoff" json:"retry_backoff"`
+	MaxRetryBackoff  string `koanf:"max_retry_backoff" yaml:"max_retry_backoff" json:"max_retry_backoff"`
 	InitializeSchema bool   `koanf:"initialize_schema" yaml:"initialize_schema" json:"initialize_schema"`
 }
 
@@ -81,11 +84,30 @@ func (c FactoryConfig) toSourceConfig() (SourceConfig, string, error) {
 		claimLease = parsed
 	}
 
+	retryBackoff, err := parseOptionalDuration(c.RetryBackoff)
+	if err != nil {
+		return SourceConfig{}, "", fmt.Errorf("retry_backoff: %w", err)
+	}
+	maxRetryBackoff, err := parseOptionalDuration(c.MaxRetryBackoff)
+	if err != nil {
+		return SourceConfig{}, "", fmt.Errorf("max_retry_backoff: %w", err)
+	}
+
 	return SourceConfig{
-		TableName:    c.TableName,
-		BatchSize:    c.BatchSize,
-		PollInterval: pollInterval,
-		ClaimLease:   claimLease,
-		ClaimOwner:   c.ClaimOwner,
+		MaxAttempts:     c.MaxAttempts,
+		RetryBackoff:    retryBackoff,
+		MaxRetryBackoff: maxRetryBackoff,
+		TableName:       c.TableName,
+		BatchSize:       c.BatchSize,
+		PollInterval:    pollInterval,
+		ClaimLease:      claimLease,
+		ClaimOwner:      c.ClaimOwner,
 	}, c.DSN, nil
+}
+
+func parseOptionalDuration(value string) (time.Duration, error) {
+	if value == "" {
+		return 0, nil
+	}
+	return time.ParseDuration(value)
 }

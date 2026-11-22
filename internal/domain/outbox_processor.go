@@ -66,31 +66,49 @@ func (p *OutboxProcessor) Close() error {
 	return closeErr
 }
 
+// handleMessages publishes each channel group independently. Messages that are
+// invalid or target an unknown channel fail permanently without affecting the
+// rest of the batch; a failing channel only fails its own messages. The
+// returned *BatchError lists every failed message so the source can delete the
+// published ones, quarantine poison records and retry transient failures.
 func (p *OutboxProcessor) handleMessages(ctx context.Context, messages ...*outbox.Message) error {
 	grouped := make(map[outbox.Channel][]outbox.Message)
+	var failures []MessageFailure
 
 	for _, message := range messages {
 		if message == nil {
-			return errors.New("message is required")
+			continue
 		}
 		if err := message.Validate(); err != nil {
-			return err
+			failures = append(failures, MessageFailure{ID: message.ID, Err: Permanent(err)})
+			continue
 		}
 
 		publisher, ok := p.publishers[message.Channel]
 		if !ok || publisher == nil {
-			return fmt.Errorf("no publisher configured for channel %q", message.Channel)
+			failures = append(failures, MessageFailure{
+				ID:  message.ID,
+				Err: Permanent(fmt.Errorf("no publisher configured for channel %q", message.Channel)),
+			})
+			continue
 		}
 
 		grouped[message.Channel] = append(grouped[message.Channel], *message)
 	}
 
 	for channel, batch := range grouped {
-		publisher := p.publishers[channel]
-		if err := publisher.Publish(ctx, batch...); err != nil {
-			return fmt.Errorf("publish batch for channel %q: %w", channel, err)
+		err := p.publishers[channel].Publish(ctx, batch...)
+		if err == nil {
+			continue
+		}
+		err = fmt.Errorf("publish batch for channel %q: %w", channel, err)
+		for _, message := range batch {
+			failures = append(failures, MessageFailure{ID: message.ID, Err: err})
 		}
 	}
 
-	return nil
+	if len(failures) == 0 {
+		return nil
+	}
+	return &BatchError{Failures: failures}
 }

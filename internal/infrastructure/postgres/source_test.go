@@ -3,7 +3,10 @@ package postgres
 import (
 	"context"
 	"errors"
+	"io"
+	"log/slog"
 	"math"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -12,6 +15,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
 
+	"github.com/petretiandrea/outbox-go/internal/domain"
 	postgresqlc "github.com/petretiandrea/outbox-go/internal/infrastructure/postgres/sqlc"
 	"github.com/petretiandrea/outbox-go/pkg/outbox"
 )
@@ -160,27 +164,31 @@ func TestDeleteMessagesRejectsStaleCompletionAfterExpiryAndReclaimWithReusedOwne
 	}
 }
 
-func TestReleaseMessagesClearsClaimAndStoresError(t *testing.T) {
+func TestReleaseMessagesClearsClaimStoresErrorAndBacksOff(t *testing.T) {
 	executor := &fakeExecutor{commandTag: pgconn.NewCommandTag("UPDATE 1")}
 	source := &PollerSource{
-		queries:    postgresqlc.New(executor),
-		claimOwner: "worker-1",
+		queries:     postgresqlc.New(executor),
+		claimOwner:  "worker-1",
+		baseBackoff: time.Second,
+		maxBackoff:  time.Minute,
 	}
 
-	cause := errors.New("publish failed")
-	err := source.releaseMessages(context.Background(), claimedBatch{claimToken: "claim-1", messages: []outbox.Message{{ID: "message-1"}}}, cause)
+	err := source.releaseMessages(context.Background(), "claim-1", []failureDisposition{{id: "message-1", err: "publish failed"}}, false)
 	if err != nil {
 		t.Fatalf("releaseMessages returned error: %v", err)
 	}
 
-	if !strings.Contains(executor.execSQL, "claimed_by = NULL") {
-		t.Fatalf("expected release query to clear claim, got %s", executor.execSQL)
+	if !strings.Contains(executor.execSQL, "claimed_by = NULL") || !strings.Contains(executor.execSQL, "next_attempt_at") {
+		t.Fatalf("expected release query to clear claim and schedule a retry, got %s", executor.execSQL)
 	}
-	if executor.execArgs[0] != (pgtype.Text{String: cause.Error(), Valid: true}) {
-		t.Fatalf("expected last_error arg %q, got %v", cause.Error(), executor.execArgs[0])
-	}
-	if !strings.Contains(executor.execSQL, "claim_token = $3") {
+	if !strings.Contains(executor.execSQL, "outbox.claim_token = $7") {
 		t.Fatalf("expected release to fence by token, got %s", executor.execSQL)
+	}
+	if executor.execArgs[0] != false || executor.execArgs[1] != int64(60000) || executor.execArgs[2] != int64(1000) {
+		t.Fatalf("unexpected backoff args: %v", executor.execArgs[:3])
+	}
+	if errs, _ := executor.execArgs[4].([]string); len(errs) != 1 || errs[0] != "publish failed" {
+		t.Fatalf("expected last_error arg, got %v", executor.execArgs[4])
 	}
 }
 
@@ -188,7 +196,7 @@ func TestReleaseMessagesRejectsLostClaim(t *testing.T) {
 	executor := &fakeExecutor{commandTag: pgconn.NewCommandTag("UPDATE 0")}
 	source := &PollerSource{queries: postgresqlc.New(executor), claimOwner: "shared-owner"}
 
-	err := source.releaseMessages(context.Background(), claimedBatch{claimToken: "stale-token", messages: []outbox.Message{{ID: "message-1"}}}, errors.New("publish failed"))
+	err := source.releaseMessages(context.Background(), "stale-token", []failureDisposition{{id: "message-1", err: "publish failed"}}, false)
 	if err == nil {
 		t.Fatal("expected stale release to be rejected")
 	}
@@ -226,7 +234,7 @@ func TestHandleWithRenewalRenewsSlowHandler(t *testing.T) {
 
 func TestSubscribeReleasesClaimAfterCancellationUsingCleanupContext(t *testing.T) {
 	executor := &fakeExecutor{commandTag: pgconn.NewCommandTag("UPDATE 1"), rows: &fakeRows{records: []rowRecord{{
-		id: "message-1", channel: "orders.created", occurredAt: time.Now(),
+		id: "message-1", channel: "orders.created", occurredAt: time.Now(), attempts: 1,
 	}}}}
 	source := &PollerSource{
 		queries: postgresqlc.New(executor), batchSize: 1, claimOwner: "shared-owner", claimLease: time.Second,
@@ -242,25 +250,201 @@ func TestSubscribeReleasesClaimAfterCancellationUsingCleanupContext(t *testing.T
 	if executor.execCtx == nil || !executor.execContextWasLive {
 		t.Fatal("expected release to use a live cleanup context after cancellation")
 	}
-	if !strings.Contains(executor.execSQL, "claim_token = $3") {
+	if !strings.Contains(executor.execSQL, "outbox.claim_token = $7") {
 		t.Fatalf("expected release to fence by claim token, got %s", executor.execSQL)
+	}
+	if executor.execArgs[0] != true {
+		t.Fatalf("expected shutdown release to be immediate, got %v", executor.execArgs[0])
 	}
 }
 
+func rows(records ...rowRecord) *fakeRows { return &fakeRows{records: records} }
+
+func record(id string, attempts int32) rowRecord {
+	return rowRecord{id: id, channel: "orders.created", payload: []byte("p"), occurredAt: time.Now(), attempts: attempts}
+}
+
+func newTestSource(executor *fakeExecutor) *PollerSource {
+	return &PollerSource{
+		queries: postgresqlc.New(executor), batchSize: 10, claimOwner: "worker-1", claimLease: time.Second,
+		pollInterval: time.Millisecond, maxAttempts: 3, baseBackoff: time.Second, maxBackoff: time.Minute,
+		logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+}
+
+func execsContaining(executor *fakeExecutor, fragment string) []execCall {
+	var out []execCall
+	for _, call := range executor.execs {
+		if strings.Contains(call.sql, fragment) {
+			out = append(out, call)
+		}
+	}
+	return out
+}
+
+func TestSettleDeletesPublishedQuarantinesPoisonAndRetriesTransient(t *testing.T) {
+	executor := &fakeExecutor{commandTag: pgconn.NewCommandTag("UPDATE 1")}
+	source := newTestSource(executor)
+	claimed := claimedBatch{
+		claimToken: "claim-1",
+		messages:   []outbox.Message{{ID: "ok"}, {ID: "poison"}, {ID: "flaky"}},
+		attempts:   map[string]int32{"ok": 1, "poison": 1, "flaky": 1},
+	}
+	handlerErr := &domain.BatchError{Failures: []domain.MessageFailure{
+		{ID: "poison", Err: domain.Permanent(errors.New("unknown channel"))},
+		{ID: "flaky", Err: errors.New("broker unavailable")},
+	}}
+
+	source.settle(context.Background(), claimed, handlerErr)
+
+	deletes := execsContaining(executor, "DELETE FROM outbox_messages")
+	if len(deletes) != 1 || !reflect.DeepEqual(deletes[0].args[2], []string{"ok"}) {
+		t.Fatalf("expected only the published message to be deleted, got %+v", deletes)
+	}
+	quarantines := execsContaining(executor, "quarantined_at = now()")
+	if len(quarantines) != 1 || !reflect.DeepEqual(quarantines[0].args[0], []string{"poison"}) {
+		t.Fatalf("expected the poison message to be quarantined, got %+v", quarantines)
+	}
+	releases := execsContaining(executor, "next_attempt_at = CASE")
+	if len(releases) != 1 || !reflect.DeepEqual(releases[0].args[3], []string{"flaky"}) || releases[0].args[0] != false {
+		t.Fatalf("expected the transient failure to be released with backoff, got %+v", releases)
+	}
+}
+
+func TestSettleQuarantinesTransientFailureAfterMaxAttempts(t *testing.T) {
+	executor := &fakeExecutor{commandTag: pgconn.NewCommandTag("UPDATE 1")}
+	source := newTestSource(executor)
+	claimed := claimedBatch{
+		claimToken: "claim-1",
+		messages:   []outbox.Message{{ID: "exhausted"}},
+		attempts:   map[string]int32{"exhausted": 3},
+	}
+
+	source.settle(context.Background(), claimed, errors.New("broker unavailable"))
+
+	quarantines := execsContaining(executor, "quarantined_at = now()")
+	if len(quarantines) != 1 {
+		t.Fatalf("expected exhausted message to be quarantined, got %+v", executor.execs)
+	}
+	if errs := quarantines[0].args[1].([]string); !strings.Contains(errs[0], "retry limit of 3 attempts exceeded") {
+		t.Fatalf("expected retry limit reason, got %v", errs)
+	}
+	if len(execsContaining(executor, "next_attempt_at = CASE")) != 0 {
+		t.Fatal("exhausted message must not be released")
+	}
+}
+
+func TestSettleQuarantinesRowsThatCannotBeDecoded(t *testing.T) {
+	executor := &fakeExecutor{commandTag: pgconn.NewCommandTag("UPDATE 1"), rows: rows(
+		rowRecord{id: "corrupt", channel: "orders.created", payload: []byte("p"), metadata: []byte("{not json"), occurredAt: time.Now(), attempts: 1},
+		record("healthy", 1),
+	)}
+	source := newTestSource(executor)
+
+	claimed, err := source.claimBatch(context.Background())
+	if err != nil {
+		t.Fatalf("a corrupt row must not fail the claim: %v", err)
+	}
+	if len(claimed.messages) != 1 || claimed.messages[0].ID != "healthy" {
+		t.Fatalf("expected only the healthy message to be handled, got %+v", claimed.messages)
+	}
+	if len(claimed.invalid) != 1 || !domain.IsPermanent(claimed.invalid[0].Err) {
+		t.Fatalf("expected corrupt row to be a permanent failure, got %+v", claimed.invalid)
+	}
+
+	source.settle(context.Background(), claimed, nil)
+	quarantines := execsContaining(executor, "quarantined_at = now()")
+	if len(quarantines) != 1 || !reflect.DeepEqual(quarantines[0].args[0], []string{"corrupt"}) {
+		t.Fatalf("expected corrupt row to be quarantined, got %+v", quarantines)
+	}
+	deletes := execsContaining(executor, "DELETE FROM outbox_messages")
+	if len(deletes) != 1 || !reflect.DeepEqual(deletes[0].args[2], []string{"healthy"}) {
+		t.Fatalf("expected healthy row to be deleted, got %+v", deletes)
+	}
+}
+
+func TestSubscribeKeepsRunningAfterClaimAndHandlerErrors(t *testing.T) {
+	executor := &fakeExecutor{
+		commandTag: pgconn.NewCommandTag("UPDATE 1"),
+		queryResults: []queryResult{
+			{err: errors.New("connection refused")},
+			{rows: rows(record("flaky", 1))},
+			{rows: rows(record("healthy", 1))},
+		},
+	}
+	source := newTestSource(executor)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var seen []string
+	err := source.Subscribe(ctx, func(messages ...*outbox.Message) error {
+		seen = append(seen, messages[0].ID)
+		if messages[0].ID == "flaky" {
+			return errors.New("broker unavailable")
+		}
+		cancel()
+		return nil
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected only cancellation to stop the loop, got %v", err)
+	}
+	if !reflect.DeepEqual(seen, []string{"flaky", "healthy"}) {
+		t.Fatalf("expected the loop to continue past errors, handled %v", seen)
+	}
+	if len(execsContaining(executor, "next_attempt_at = CASE")) == 0 {
+		t.Fatal("expected the failed message to be released with backoff")
+	}
+	deletes := execsContaining(executor, "DELETE FROM outbox_messages")
+	if len(deletes) != 1 || !reflect.DeepEqual(deletes[0].args[2], []string{"healthy"}) {
+		t.Fatalf("expected healthy message to be deleted, got %+v", deletes)
+	}
+}
+
+func TestNewPollerSourceValidatesRetryConfig(t *testing.T) {
+	if _, err := NewPollerSource(&fakeExecutor{}, SourceConfig{RetryBackoff: time.Minute, MaxRetryBackoff: time.Second}); err == nil {
+		t.Fatal("expected max backoff below base backoff to be rejected")
+	}
+	source, err := NewPollerSource(&fakeExecutor{}, SourceConfig{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if source.maxAttempts != defaultMaxAttempts || source.baseBackoff != defaultBaseBackoff || source.maxBackoff != defaultMaxBackoff {
+		t.Fatalf("unexpected retry defaults: %+v", source)
+	}
+}
+
+type execCall struct {
+	sql  string
+	args []any
+}
+
+type queryResult struct {
+	rows pgx.Rows
+	err  error
+}
+
 type fakeExecutor struct {
-	rows       pgx.Rows
-	querySQL   string
-	queryArgs  []any
-	execSQL    string
-	execArgs   []any
-	execCtx               context.Context
-	execContextWasLive    bool
-	commandTag pgconn.CommandTag
+	rows               pgx.Rows
+	querySQL           string
+	queryArgs          []any
+	execSQL            string
+	execArgs           []any
+	execCtx            context.Context
+	execContextWasLive bool
+	commandTag         pgconn.CommandTag
+
+	execs        []execCall
+	queryResults []queryResult
 }
 
 func (e *fakeExecutor) Query(_ context.Context, sql string, args ...any) (pgx.Rows, error) {
 	e.querySQL = sql
 	e.queryArgs = args
+	if len(e.queryResults) > 0 {
+		next := e.queryResults[0]
+		e.queryResults = e.queryResults[1:]
+		return next.rows, next.err
+	}
 	if e.rows == nil {
 		return &fakeRows{}, nil
 	}
@@ -272,6 +456,7 @@ func (e *fakeExecutor) Exec(ctx context.Context, sql string, args ...any) (pgcon
 	e.execContextWasLive = ctx.Err() == nil
 	e.execSQL = sql
 	e.execArgs = args
+	e.execs = append(e.execs, execCall{sql: sql, args: args})
 	if e.commandTag.String() == "" {
 		return pgconn.NewCommandTag("OK"), nil
 	}
@@ -287,6 +472,7 @@ type rowRecord struct {
 	payload     []byte
 	metadata    []byte
 	occurredAt  time.Time
+	attempts    int32
 }
 
 type fakeRows struct {
@@ -324,6 +510,7 @@ func (r *fakeRows) Scan(dest ...any) error {
 	*(dest[3].(*[]byte)) = record.payload
 	*(dest[4].(*[]byte)) = record.metadata
 	*(dest[5].(*pgtype.Timestamptz)) = pgtype.Timestamptz{Time: record.occurredAt, Valid: true}
+	*(dest[6].(*int32)) = record.attempts
 	return nil
 }
 

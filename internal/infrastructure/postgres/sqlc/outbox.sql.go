@@ -15,7 +15,9 @@ const claimOutboxMessages = `-- name: ClaimOutboxMessages :many
 WITH candidate AS (
     SELECT id
     FROM outbox_messages
-    WHERE claimed_until IS NULL OR claimed_until <= now()
+    WHERE quarantined_at IS NULL
+      AND (claimed_until IS NULL OR claimed_until <= now())
+      AND (next_attempt_at IS NULL OR next_attempt_at <= now())
     ORDER BY occurred_at ASC, id ASC
     LIMIT $1
     FOR UPDATE SKIP LOCKED
@@ -29,9 +31,9 @@ claimed AS (
         last_error = NULL
     FROM candidate
     WHERE outbox.id = candidate.id
-    RETURNING outbox.id, outbox.channel, outbox.affinity_key, outbox.payload, outbox.metadata, outbox.occurred_at
+    RETURNING outbox.id, outbox.channel, outbox.affinity_key, outbox.payload, outbox.metadata, outbox.occurred_at, outbox.attempts
 )
-SELECT id, channel, affinity_key, payload, metadata, occurred_at
+SELECT id, channel, affinity_key, payload, metadata, occurred_at, attempts
 FROM claimed
 ORDER BY occurred_at ASC, id ASC
 `
@@ -50,6 +52,7 @@ type ClaimOutboxMessagesRow struct {
 	Payload     []byte             `json:"payload"`
 	Metadata    []byte             `json:"metadata"`
 	OccurredAt  pgtype.Timestamptz `json:"occurred_at"`
+	Attempts    int32              `json:"attempts"`
 }
 
 func (q *Queries) ClaimOutboxMessages(ctx context.Context, arg ClaimOutboxMessagesParams) ([]ClaimOutboxMessagesRow, error) {
@@ -68,6 +71,7 @@ func (q *Queries) ClaimOutboxMessages(ctx context.Context, arg ClaimOutboxMessag
 			&i.Payload,
 			&i.Metadata,
 			&i.OccurredAt,
+			&i.Attempts,
 		); err != nil {
 			return nil, err
 		}
@@ -88,9 +92,9 @@ WHERE claimed_by = $1
 `
 
 type DeleteClaimedOutboxMessagesParams struct {
-	ClaimedBy pgtype.Text `json:"claimed_by"`
+	ClaimedBy  pgtype.Text `json:"claimed_by"`
 	ClaimToken pgtype.Text `json:"claim_token"`
-	Ids       []string    `json:"ids"`
+	Ids        []string    `json:"ids"`
 }
 
 func (q *Queries) DeleteClaimedOutboxMessages(ctx context.Context, arg DeleteClaimedOutboxMessagesParams) (int64, error) {
@@ -101,27 +105,87 @@ func (q *Queries) DeleteClaimedOutboxMessages(ctx context.Context, arg DeleteCla
 	return result.RowsAffected(), nil
 }
 
-const releaseClaimedOutboxMessages = `-- name: ReleaseClaimedOutboxMessages :execrows
-UPDATE outbox_messages
+const quarantineClaimedOutboxMessages = `-- name: QuarantineClaimedOutboxMessages :execrows
+UPDATE outbox_messages AS outbox
 SET claimed_by = NULL,
     claim_token = NULL,
     claimed_until = NULL,
-    last_error = $1
-WHERE claimed_by = $2
-  AND claim_token = $3
-  AND claimed_until > now()
-  AND id = ANY($4::text[])
+    next_attempt_at = NULL,
+    quarantined_at = now(),
+    last_error = failure.error
+FROM unnest($1::text[], $2::text[]) AS failure(id, error)
+WHERE outbox.id = failure.id
+  AND outbox.claimed_by = $3
+  AND outbox.claim_token = $4
+  AND outbox.claimed_until > now()
+`
+
+type QuarantineClaimedOutboxMessagesParams struct {
+	Ids        []string    `json:"ids"`
+	Errors     []string    `json:"errors"`
+	ClaimedBy  pgtype.Text `json:"claimed_by"`
+	ClaimToken pgtype.Text `json:"claim_token"`
+}
+
+// Moves poison rows out of the claim queue. They stay in the table with
+// last_error and attempts for inspection; clear quarantined_at to retry them.
+func (q *Queries) QuarantineClaimedOutboxMessages(ctx context.Context, arg QuarantineClaimedOutboxMessagesParams) (int64, error) {
+	result, err := q.db.Exec(ctx, quarantineClaimedOutboxMessages,
+		arg.Ids,
+		arg.Errors,
+		arg.ClaimedBy,
+		arg.ClaimToken,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const releaseClaimedOutboxMessages = `-- name: ReleaseClaimedOutboxMessages :execrows
+UPDATE outbox_messages AS outbox
+SET claimed_by = NULL,
+    claim_token = NULL,
+    claimed_until = NULL,
+    attempts = CASE WHEN $1::boolean THEN GREATEST(outbox.attempts - 1, 0) ELSE outbox.attempts END,
+    next_attempt_at = CASE
+        WHEN $1::boolean THEN NULL
+        ELSE now() + LEAST(
+            $2::bigint,
+            $3::bigint * power(2, LEAST(GREATEST(outbox.attempts - 1, 0), 30))::bigint
+        ) * interval '1 millisecond'
+    END,
+    last_error = failure.error
+FROM unnest($4::text[], $5::text[]) AS failure(id, error)
+WHERE outbox.id = failure.id
+  AND outbox.claimed_by = $6
+  AND outbox.claim_token = $7
+  AND outbox.claimed_until > now()
 `
 
 type ReleaseClaimedOutboxMessagesParams struct {
-	LastError pgtype.Text `json:"last_error"`
-	ClaimedBy pgtype.Text `json:"claimed_by"`
-	ClaimToken pgtype.Text `json:"claim_token"`
-	Ids       []string    `json:"ids"`
+	Immediate               bool        `json:"immediate"`
+	MaxBackoffMilliseconds  int64       `json:"max_backoff_milliseconds"`
+	BaseBackoffMilliseconds int64       `json:"base_backoff_milliseconds"`
+	Ids                     []string    `json:"ids"`
+	Errors                  []string    `json:"errors"`
+	ClaimedBy               pgtype.Text `json:"claimed_by"`
+	ClaimToken              pgtype.Text `json:"claim_token"`
 }
 
+// Returns rows to the queue. next_attempt_at is now() plus an exponential
+// backoff derived from the attempts counter, capped at max_backoff. When
+// immediate is true (shutdown) the attempt is not counted and not delayed.
 func (q *Queries) ReleaseClaimedOutboxMessages(ctx context.Context, arg ReleaseClaimedOutboxMessagesParams) (int64, error) {
-	result, err := q.db.Exec(ctx, releaseClaimedOutboxMessages, arg.LastError, arg.ClaimedBy, arg.ClaimToken, arg.Ids)
+	result, err := q.db.Exec(ctx, releaseClaimedOutboxMessages,
+		arg.Immediate,
+		arg.MaxBackoffMilliseconds,
+		arg.BaseBackoffMilliseconds,
+		arg.Ids,
+		arg.Errors,
+		arg.ClaimedBy,
+		arg.ClaimToken,
+	)
 	if err != nil {
 		return 0, err
 	}
