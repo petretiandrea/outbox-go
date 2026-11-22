@@ -102,6 +102,7 @@ func (c FactoryConfig) toSourceConfig() (SourceConfig, string, error) {
 		PollInterval:    pollInterval,
 		ClaimLease:      claimLease,
 		ClaimOwner:      c.ClaimOwner,
+		Metrics:         NewLogMetrics(nil),
 	}, c.DSN, nil
 }
 

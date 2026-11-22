@@ -12,11 +12,15 @@ import (
 type OutboxProcessorConfig struct {
 	Source     Source
 	Publishers map[outbox.Channel]outbox.Publisher
+	// DeadLetterChannel optionally names a configured channel that receives
+	// messages that cannot be published. The source must be a DeadLetterSource.
+	DeadLetterChannel outbox.Channel
 }
 
 type OutboxProcessor struct {
-	source     Source
-	publishers map[outbox.Channel]outbox.Publisher
+	source            Source
+	publishers        map[outbox.Channel]outbox.Publisher
+	deadLetterChannel outbox.Channel
 }
 
 func NewOutboxProcessor(config OutboxProcessorConfig) (*OutboxProcessor, error) {
@@ -38,10 +42,24 @@ func NewOutboxProcessor(config OutboxProcessorConfig) (*OutboxProcessor, error) 
 		publishers[channel] = publisher
 	}
 
-	return &OutboxProcessor{
-		source:     config.Source,
-		publishers: publishers,
-	}, nil
+	processor := &OutboxProcessor{
+		source:            config.Source,
+		publishers:        publishers,
+		deadLetterChannel: outbox.Channel(strings.TrimSpace(string(config.DeadLetterChannel))),
+	}
+
+	if processor.deadLetterChannel != "" {
+		dlqSource, ok := config.Source.(DeadLetterSource)
+		if !ok {
+			return nil, errors.New("dead-letter channel is configured but the source does not support dead-lettering")
+		}
+		if _, ok := publishers[processor.deadLetterChannel]; !ok {
+			return nil, fmt.Errorf("dead-letter channel %q is not a configured channel", processor.deadLetterChannel)
+		}
+		dlqSource.SetDeadLetterHandler(processor.deadLetter)
+	}
+
+	return processor, nil
 }
 
 func (p *OutboxProcessor) Process(ctx context.Context) error {
@@ -70,7 +88,7 @@ func (p *OutboxProcessor) Close() error {
 // invalid or target an unknown channel fail permanently without affecting the
 // rest of the batch; a failing channel only fails its own messages. The
 // returned *BatchError lists every failed message so the source can delete the
-// published ones, quarantine poison records and retry transient failures.
+// published ones, dead-letter poison records and retry transient failures.
 func (p *OutboxProcessor) handleMessages(ctx context.Context, messages ...*outbox.Message) error {
 	grouped := make(map[outbox.Channel][]outbox.Message)
 	var failures []MessageFailure
@@ -111,4 +129,22 @@ func (p *OutboxProcessor) handleMessages(ctx context.Context, messages ...*outbo
 		return nil
 	}
 	return &BatchError{Failures: failures}
+}
+
+// deadLetter publishes messages that could not be delivered to the dead-letter
+// channel. It returns nil only when the publisher acknowledged all of them.
+func (p *OutboxProcessor) deadLetter(ctx context.Context, letters ...DeadLetter) error {
+	if len(letters) == 0 {
+		return nil
+	}
+
+	messages := make([]outbox.Message, 0, len(letters))
+	for _, letter := range letters {
+		messages = append(messages, letter.toMessage(p.deadLetterChannel))
+	}
+
+	if err := p.publishers[p.deadLetterChannel].Publish(ctx, messages...); err != nil {
+		return fmt.Errorf("publish to dead-letter channel %q: %w", p.deadLetterChannel, err)
+	}
+	return nil
 }

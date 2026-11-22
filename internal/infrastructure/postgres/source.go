@@ -42,15 +42,20 @@ type SourceConfig struct {
 	ClaimOwner   string
 
 	// MaxAttempts bounds how many times a row is claimed before a transient
-	// failure quarantines it. 0 selects the default (20); a negative value
-	// retries forever. Permanent failures are quarantined immediately.
+	// failure dead-letters it. 0 selects the default (20); a negative value
+	// retries forever. Permanent failures are dead-lettered immediately.
 	MaxAttempts int
 	// RetryBackoff is the delay after the first failed attempt; it doubles on
 	// every further attempt up to MaxRetryBackoff.
 	RetryBackoff    time.Duration
 	MaxRetryBackoff time.Duration
-	// Logger receives retry and quarantine events. Defaults to slog.Default().
+	// Logger receives retry and dead-letter events. Defaults to slog.Default().
 	Logger *slog.Logger
+	// Metrics receives dead-letter counters and periodic table statistics.
+	// Optional.
+	Metrics Metrics
+	// MetricsInterval is how often statistics are queried. Default is 15s.
+	MetricsInterval time.Duration
 }
 
 type PollerSource struct {
@@ -65,6 +70,13 @@ type PollerSource struct {
 	baseBackoff time.Duration
 	maxBackoff  time.Duration
 	logger      *slog.Logger
+
+	// deadLetter, when set, receives rows that failed permanently. It must be
+	// set before Subscribe.
+	deadLetter      domain.DeadLetterHandler
+	metrics         Metrics
+	metricsInterval time.Duration
+	lastStats       time.Time
 }
 
 type claimedBatch struct {
@@ -72,14 +84,22 @@ type claimedBatch struct {
 	claimToken string
 	attempts   map[string]int32
 	// invalid holds claimed rows that cannot be converted into a message
-	// (e.g. corrupt metadata). They are quarantined without being handled.
+	// (e.g. corrupt metadata). They are dead-lettered without being handled.
 	invalid []domain.MessageFailure
+	// invalidMessages holds what could be read of the invalid rows, by ID.
+	invalidMessages map[string]outbox.Message
+	// deadLetters are rows that already failed permanently in an earlier claim
+	// and only wait for the DLQ to acknowledge them.
+	deadLetters []domain.DeadLetter
 }
 
 func (c claimedBatch) claimedIDs() []string {
 	ids := messageIDs(c.messages)
 	for _, f := range c.invalid {
 		ids = append(ids, f.ID)
+	}
+	for _, d := range c.deadLetters {
+		ids = append(ids, d.Message.ID)
 	}
 	return ids
 }
@@ -145,17 +165,24 @@ func NewPollerSource(db postgresqlc.DBTX, config SourceConfig) (*PollerSource, e
 		return nil, errors.New("postgres source max retry backoff must not be below the retry backoff")
 	}
 
+	metricsInterval := config.MetricsInterval
+	if metricsInterval <= 0 {
+		metricsInterval = defaultMetricsInterval
+	}
+
 	return &PollerSource{
-		maxAttempts:  maxAttempts,
-		baseBackoff:  baseBackoff,
-		maxBackoff:   maxBackoff,
-		logger:       config.Logger,
-		queries:      postgresqlc.New(db),
-		batchSize:    batchSize,
-		pollInterval: pollInterval,
-		claimLease:   claimLease,
-		claimOwner:   claimOwner,
-		closeFn:      func() error { return nil },
+		maxAttempts:     maxAttempts,
+		baseBackoff:     baseBackoff,
+		maxBackoff:      maxBackoff,
+		logger:          config.Logger,
+		metrics:         config.Metrics,
+		metricsInterval: metricsInterval,
+		queries:         postgresqlc.New(db),
+		batchSize:       batchSize,
+		pollInterval:    pollInterval,
+		claimLease:      claimLease,
+		claimOwner:      claimOwner,
+		closeFn:         func() error { return nil },
 	}, nil
 }
 
@@ -182,8 +209,8 @@ func NewPollerSourceFromPool(pool *pgxpool.Pool, config SourceConfig) (*PollerSo
 // Failures never stop the loop. A handler error is interpreted as follows:
 //   - nil: every message of the batch was published and is deleted.
 //   - *domain.BatchError: only the listed messages failed; the others are
-//     deleted. Permanent failures are quarantined, transient ones are released
-//     with exponential backoff and quarantined once MaxAttempts is exhausted.
+//     deleted. Permanent failures are dead-lettered, transient ones are released
+//     with exponential backoff and dead-lettered once MaxAttempts is exhausted.
 //   - any other error: the whole batch failed transiently.
 //
 // Database errors while claiming or settling are logged and retried with
@@ -201,6 +228,8 @@ func (s *PollerSource) Subscribe(ctx context.Context, handler func(...*outbox.Me
 		default:
 		}
 
+		s.reportStats(ctx)
+
 		claimed, err := s.claimBatch(ctx)
 		if err != nil {
 			if ctx.Err() != nil {
@@ -215,7 +244,7 @@ func (s *PollerSource) Subscribe(ctx context.Context, handler func(...*outbox.Me
 		}
 		consecutiveClaimErrors = 0
 
-		if len(claimed.messages) == 0 && len(claimed.invalid) == 0 {
+		if len(claimed.messages) == 0 && len(claimed.invalid) == 0 && len(claimed.deadLetters) == 0 {
 			if err := s.sleep(ctx, s.pollInterval); err != nil {
 				return err
 			}
@@ -283,8 +312,17 @@ type failureDisposition struct {
 	err string
 }
 
+// SetDeadLetterHandler routes rows that fail permanently (or exhaust
+// MaxAttempts) to handler instead of parking them. A row is marked
+// dead-lettered only after handler returns nil; otherwise the DLQ publish is
+// retried with backoff and the row stays in the table. It must be called
+// before Subscribe.
+func (s *PollerSource) SetDeadLetterHandler(handler domain.DeadLetterHandler) {
+	s.deadLetter = handler
+}
+
 // settle records the outcome of a handled batch. Published messages are
-// deleted; failed ones are quarantined or released. It uses a context that
+// deleted; failed ones are dead-lettered or released. It uses a context that
 // outlives ctx so that a shutdown still records what was already published.
 // Errors are logged: rows whose completion could not be recorded simply become
 // claimable again once their lease expires (at-least-once delivery).
@@ -310,16 +348,21 @@ func (s *PollerSource) settle(ctx context.Context, claimed claimedBatch, handler
 	}
 
 	var succeeded []outbox.Message
+	messagesByID := make(map[string]outbox.Message, len(claimed.messages)+len(claimed.invalidMessages))
 	for _, m := range claimed.messages {
+		messagesByID[m.ID] = m
 		if _, failed := failures[m.ID]; !failed {
 			succeeded = append(succeeded, m)
 		}
+	}
+	for id, m := range claimed.invalidMessages {
+		messagesByID[id] = m
 	}
 	if err := s.deleteMessages(cleanupCtx, claimedBatch{messages: succeeded, claimToken: claimed.claimToken}); err != nil {
 		s.log().Error("outbox completion failed; published messages may be delivered again", "error", err)
 	}
 
-	var quarantine, retry, immediate []failureDisposition
+	var dead, retry, immediate []failureDisposition
 	for _, id := range claimed.claimedIDs() {
 		failure, failed := failures[id]
 		if !failed {
@@ -329,19 +372,33 @@ func (s *PollerSource) settle(ctx context.Context, claimed claimedBatch, handler
 		attempts := claimed.attempts[id]
 		switch {
 		case failure.Permanent():
-			quarantine = append(quarantine, failureDisposition{id, text})
+			dead = append(dead, failureDisposition{id, text})
 		case ctx.Err() != nil:
 			// Shutdown: the failure says nothing about the message.
 			immediate = append(immediate, failureDisposition{id, text})
 		case s.maxAttempts > 0 && int(attempts) >= s.maxAttempts:
-			quarantine = append(quarantine, failureDisposition{id, fmt.Sprintf("retry limit of %d attempts exceeded: %s", s.maxAttempts, text)})
+			dead = append(dead, failureDisposition{id, fmt.Sprintf("retry limit of %d attempts exceeded: %s", s.maxAttempts, text)})
 		default:
 			retry = append(retry, failureDisposition{id, text})
 		}
 	}
 
-	if err := s.quarantineMessages(cleanupCtx, claimed.claimToken, quarantine); err != nil {
-		s.log().Error("outbox quarantine failed", "error", err)
+	if s.deadLetter == nil {
+		if err := s.parkMessages(cleanupCtx, claimed.claimToken, dead); err != nil {
+			s.log().Error("outbox dead-lettering failed", "error", err)
+		}
+	} else {
+		letters := append([]domain.DeadLetter(nil), claimed.deadLetters...)
+		now := time.Now().UTC()
+		for _, item := range dead {
+			letters = append(letters, domain.DeadLetter{
+				Message:   messagesByID[item.id],
+				Attempts:  int(claimed.attempts[item.id]),
+				LastError: item.err,
+				FailedAt:  now,
+			})
+		}
+		s.deadLetterMessages(cleanupCtx, claimed.claimToken, dead, letters)
 	}
 	if err := s.releaseMessages(cleanupCtx, claimed.claimToken, retry, false); err != nil {
 		s.log().Error("outbox release failed", "error", err)
@@ -349,6 +406,48 @@ func (s *PollerSource) settle(ctx context.Context, claimed claimedBatch, handler
 	if err := s.releaseMessages(cleanupCtx, claimed.claimToken, immediate, true); err != nil {
 		s.log().Error("outbox release failed", "error", err)
 	}
+}
+
+// deadLetterMessages publishes letters to the DLQ and marks the rows as
+// dead-lettered only after the DLQ acknowledged them. fresh lists the rows that
+// failed just now: they are first durably marked failed (keeping the claim) so
+// that a crash resumes at the DLQ step. If the DLQ publish fails the rows are
+// released with backoff and retried; they are never lost or parked unmarked.
+func (s *PollerSource) deadLetterMessages(ctx context.Context, claimToken string, fresh []failureDisposition, letters []domain.DeadLetter) {
+	if len(letters) == 0 {
+		return
+	}
+	if err := s.markFailedMessages(ctx, claimToken, fresh); err != nil {
+		// Nothing was published to the DLQ. The rows become claimable again
+		// when their lease expires and take the same path.
+		s.log().Error("outbox failure marking failed; rows will be retried after the lease expires", "error", err)
+		return
+	}
+
+	batch := claimedBatch{claimToken: claimToken, deadLetters: letters}
+	publishErr, renewErr := s.runWithRenewal(batch, func() error { return s.deadLetter(ctx, letters...) })
+	if renewErr != nil {
+		s.log().Warn("outbox claim renewal failed while dead-lettering; the claim may have been lost", "error", renewErr)
+	}
+
+	ids := batch.claimedIDs()
+	if publishErr != nil {
+		s.log().Error("outbox dead-letter publish failed; will be retried", "count", len(ids), "error", publishErr)
+		s.reportDeadLetterRetried(len(ids))
+		if err := s.releaseDeadLetters(ctx, claimToken, ids); err != nil {
+			s.log().Error("outbox dead-letter release failed", "error", err)
+		}
+		return
+	}
+
+	for _, letter := range letters {
+		s.log().Error("outbox message dead-lettered", "message_id", letter.Message.ID, "channel", letter.Message.Channel, "attempts", letter.Attempts, "error", letter.LastError)
+	}
+	if err := s.completeDeadLetters(ctx, claimToken, ids); err != nil {
+		s.log().Error("outbox dead-letter completion failed; messages may reach the DLQ again", "error", err)
+		return
+	}
+	s.reportDeadLettered(len(ids))
 }
 
 func truncateError(err error) string {
@@ -373,6 +472,7 @@ func (s *PollerSource) claimBatch(ctx context.Context) (claimedBatch, error) {
 	}
 
 	records, err := s.queries.ClaimOutboxMessages(ctx, postgresqlc.ClaimOutboxMessagesParams{
+		DeadLetterEnabled:      s.deadLetter != nil,
 		BatchSize:              int32(s.batchSize),
 		ClaimedBy:              requiredText(s.claimOwner),
 		ClaimToken:             requiredText(claimToken),
@@ -390,7 +490,21 @@ func (s *PollerSource) claimBatch(ctx context.Context) (claimedBatch, error) {
 	for _, record := range records {
 		claimed.attempts[record.ID] = record.Attempts
 		message, err := toMessage(record)
+		if record.FailedAt.Valid {
+			// Failed permanently in an earlier claim: it only awaits the DLQ.
+			claimed.deadLetters = append(claimed.deadLetters, domain.DeadLetter{
+				Message:   message,
+				Attempts:  int(record.Attempts),
+				LastError: record.LastError.String,
+				FailedAt:  record.FailedAt.Time.UTC(),
+			})
+			continue
+		}
 		if err != nil {
+			if claimed.invalidMessages == nil {
+				claimed.invalidMessages = make(map[string]outbox.Message)
+			}
+			claimed.invalidMessages[record.ID] = message
 			claimed.invalid = append(claimed.invalid, domain.MessageFailure{ID: record.ID, Err: domain.Permanent(err)})
 			continue
 		}
@@ -458,32 +572,127 @@ func (s *PollerSource) releaseMessages(ctx context.Context, claimToken string, i
 	return nil
 }
 
-// quarantineMessages parks poison rows so they stop blocking the queue.
-func (s *PollerSource) quarantineMessages(ctx context.Context, claimToken string, items []failureDisposition) error {
+// parkMessages dead-letters poison rows when no DLQ is configured, so they stop
+// blocking the queue. They stay in the table for inspection and replay.
+func (s *PollerSource) parkMessages(ctx context.Context, claimToken string, items []failureDisposition) error {
 	if len(items) == 0 {
 		return nil
 	}
 	ids, errs := splitDispositions(items)
 	for _, item := range items {
-		s.log().Error("outbox message quarantined", "message_id", item.id, "error", item.err)
+		s.log().Error("outbox message dead-lettered (parked, no DLQ configured)", "message_id", item.id, "error", item.err)
 	}
 
-	quarantined, err := s.queries.QuarantineClaimedOutboxMessages(ctx, postgresqlc.QuarantineClaimedOutboxMessagesParams{
+	parked, err := s.queries.ParkClaimedOutboxMessages(ctx, postgresqlc.ParkClaimedOutboxMessagesParams{
 		Ids:        ids,
 		Errors:     errs,
 		ClaimedBy:  requiredText(s.claimOwner),
 		ClaimToken: requiredText(claimToken),
 	})
 	if err != nil {
-		return fmt.Errorf("quarantine outbox messages: %w", err)
+		return fmt.Errorf("dead-letter outbox messages: %w", err)
 	}
-	if quarantined != int64(len(ids)) {
-		return fmt.Errorf("quarantine outbox messages: quarantined %d of %d claimed messages (claim was lost)", quarantined, len(ids))
+	if parked != int64(len(ids)) {
+		return fmt.Errorf("dead-letter outbox messages: parked %d of %d claimed messages (claim was lost)", parked, len(ids))
+	}
+	s.reportDeadLettered(len(ids))
+	return nil
+}
+
+// markFailedMessages durably records permanent failures while keeping the claim.
+func (s *PollerSource) markFailedMessages(ctx context.Context, claimToken string, items []failureDisposition) error {
+	if len(items) == 0 {
+		return nil
+	}
+	ids, errs := splitDispositions(items)
+	marked, err := s.queries.MarkFailedOutboxMessages(ctx, postgresqlc.MarkFailedOutboxMessagesParams{
+		Ids:        ids,
+		Errors:     errs,
+		ClaimedBy:  requiredText(s.claimOwner),
+		ClaimToken: requiredText(claimToken),
+	})
+	if err != nil {
+		return fmt.Errorf("mark outbox messages failed: %w", err)
+	}
+	if marked != int64(len(ids)) {
+		return fmt.Errorf("mark outbox messages failed: marked %d of %d claimed messages (claim was lost)", marked, len(ids))
 	}
 	return nil
 }
 
+// completeDeadLetters marks rows dead-lettered. Call it only after the DLQ acknowledged them.
+func (s *PollerSource) completeDeadLetters(ctx context.Context, claimToken string, ids []string) error {
+	completed, err := s.queries.CompleteDeadLetterOutboxMessages(ctx, postgresqlc.CompleteDeadLetterOutboxMessagesParams{
+		ClaimedBy:  requiredText(s.claimOwner),
+		ClaimToken: requiredText(claimToken),
+		Ids:        ids,
+	})
+	if err != nil {
+		return fmt.Errorf("complete dead-lettered outbox messages: %w", err)
+	}
+	if completed != int64(len(ids)) {
+		return fmt.Errorf("complete dead-lettered outbox messages: completed %d of %d claimed messages (claim was lost)", completed, len(ids))
+	}
+	return nil
+}
+
+// releaseDeadLetters schedules a DLQ retry with exponential backoff.
+func (s *PollerSource) releaseDeadLetters(ctx context.Context, claimToken string, ids []string) error {
+	released, err := s.queries.ReleaseDeadLetterOutboxMessages(ctx, postgresqlc.ReleaseDeadLetterOutboxMessagesParams{
+		MaxBackoffMilliseconds:  s.maxBackoff.Milliseconds(),
+		BaseBackoffMilliseconds: s.baseBackoff.Milliseconds(),
+		ClaimedBy:               requiredText(s.claimOwner),
+		ClaimToken:              requiredText(claimToken),
+		Ids:                     ids,
+	})
+	if err != nil {
+		return fmt.Errorf("release dead-letter outbox messages: %w", err)
+	}
+	if released != int64(len(ids)) {
+		return fmt.Errorf("release dead-letter outbox messages: released %d of %d claimed messages (claim was lost)", released, len(ids))
+	}
+	return nil
+}
+
+func (s *PollerSource) reportDeadLettered(count int) {
+	if s.metrics != nil && count > 0 {
+		s.metrics.DeadLettered(count)
+	}
+}
+
+func (s *PollerSource) reportDeadLetterRetried(count int) {
+	if s.metrics != nil && count > 0 {
+		s.metrics.DeadLetterRetried(count)
+	}
+}
+
+// reportStats queries table statistics at most once per metricsInterval.
+func (s *PollerSource) reportStats(ctx context.Context) {
+	if s.metrics == nil || time.Since(s.lastStats) < s.metricsInterval {
+		return
+	}
+	s.lastStats = time.Now()
+
+	stats, err := s.queries.GetOutboxStats(ctx)
+	if err != nil {
+		if ctx.Err() == nil {
+			s.log().Warn("outbox statistics query failed", "error", err)
+		}
+		return
+	}
+	s.metrics.Snapshot(Stats{
+		OldestClaimableAge: time.Duration(stats.OldestClaimableAgeSeconds * float64(time.Second)),
+		DeadLettered:       stats.DeadLetteredCount,
+		PendingDeadLetter:  stats.PendingDeadLetterCount,
+	})
+}
+
 func (s *PollerSource) handleWithRenewal(claimed claimedBatch, handler func(...*outbox.Message) error, batch []*outbox.Message) (error, error) {
+	return s.runWithRenewal(claimed, func() error { return handler(batch...) })
+}
+
+// runWithRenewal runs fn while renewing the lease of every row in claimed.
+func (s *PollerSource) runWithRenewal(claimed claimedBatch, fn func() error) (error, error) {
 	stop := make(chan struct{})
 	workerDone := make(chan struct{})
 	renewErr := make(chan error, 1)
@@ -508,7 +717,7 @@ func (s *PollerSource) handleWithRenewal(claimed claimedBatch, handler func(...*
 		}
 	}()
 
-	handlerErr := handler(batch...)
+	handlerErr := fn()
 	close(stop)
 	<-workerDone
 	return handlerErr, receiveRenewalError(renewErr)
@@ -519,13 +728,13 @@ func (s *PollerSource) renewClaim(ctx context.Context, claimed claimedBatch) err
 		ClaimLeaseMilliseconds: s.claimLease.Milliseconds(),
 		ClaimedBy:              requiredText(s.claimOwner),
 		ClaimToken:             requiredText(claimed.claimToken),
-		Ids:                    messageIDs(claimed.messages),
+		Ids:                    claimed.claimedIDs(),
 	})
 	if err != nil {
 		return fmt.Errorf("renew claimed outbox messages: %w", err)
 	}
-	if renewed != int64(len(claimed.messages)) {
-		return fmt.Errorf("renew claimed outbox messages: renewed %d of %d claimed messages (claim was lost)", renewed, len(claimed.messages))
+	if renewed != int64(len(claimed.claimedIDs())) {
+		return fmt.Errorf("renew claimed outbox messages: renewed %d of %d claimed messages (claim was lost)", renewed, len(claimed.claimedIDs()))
 	}
 	return nil
 }
@@ -552,23 +761,24 @@ func newClaimToken() (string, error) {
 }
 
 func toMessage(record postgresqlc.ClaimOutboxMessagesRow) (outbox.Message, error) {
-	var metadata outbox.Metadata
-	if len(record.Metadata) > 0 {
-		if err := json.Unmarshal(record.Metadata, &metadata); err != nil {
-			return outbox.Message{}, fmt.Errorf("unmarshal metadata for message %q: %w", record.ID, err)
-		}
-	}
-
 	message := outbox.Message{
 		ID:         record.ID,
 		Channel:    outbox.Channel(record.Channel),
 		Payload:    outbox.Payload(record.Payload),
-		Metadata:   metadata,
 		OccurredAt: record.OccurredAt.Time.UTC(),
 	}
-
 	if record.AffinityKey.Valid {
 		message.AffinityKey = outbox.AffinityKey(record.AffinityKey.String)
+	}
+
+	// On corrupt metadata the rest of the message is still returned so that it
+	// can be dead-lettered with its payload.
+	if len(record.Metadata) > 0 {
+		var metadata outbox.Metadata
+		if err := json.Unmarshal(record.Metadata, &metadata); err != nil {
+			return message, fmt.Errorf("unmarshal metadata for message %q: %w", record.ID, err)
+		}
+		message.Metadata = metadata
 	}
 
 	return message, nil
