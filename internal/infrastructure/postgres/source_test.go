@@ -181,14 +181,14 @@ func TestReleaseMessagesClearsClaimStoresErrorAndBacksOff(t *testing.T) {
 	if !strings.Contains(executor.execSQL, "claimed_by = NULL") || !strings.Contains(executor.execSQL, "next_attempt_at") {
 		t.Fatalf("expected release query to clear claim and schedule a retry, got %s", executor.execSQL)
 	}
-	if !strings.Contains(executor.execSQL, "outbox.claim_token = $7") {
+	if !strings.Contains(executor.execSQL, "outbox.claim_token = $5") {
 		t.Fatalf("expected release to fence by token, got %s", executor.execSQL)
 	}
 	if executor.execArgs[0] != false || executor.execArgs[1] != int64(60000) || executor.execArgs[2] != int64(1000) {
 		t.Fatalf("unexpected backoff args: %v", executor.execArgs[:3])
 	}
-	if errs, _ := executor.execArgs[4].([]string); len(errs) != 1 || errs[0] != "publish failed" {
-		t.Fatalf("expected last_error arg, got %v", executor.execArgs[4])
+	if errs, _ := executor.execArgs[6].([]string); len(errs) != 1 || errs[0] != "publish failed" {
+		t.Fatalf("expected last_error arg, got %v", executor.execArgs[6])
 	}
 }
 
@@ -250,7 +250,7 @@ func TestSubscribeReleasesClaimAfterCancellationUsingCleanupContext(t *testing.T
 	if executor.execCtx == nil || !executor.execContextWasLive {
 		t.Fatal("expected release to use a live cleanup context after cancellation")
 	}
-	if !strings.Contains(executor.execSQL, "outbox.claim_token = $7") {
+	if !strings.Contains(executor.execSQL, "outbox.claim_token = $5") {
 		t.Fatalf("expected release to fence by claim token, got %s", executor.execSQL)
 	}
 	if executor.execArgs[0] != true {
@@ -302,11 +302,11 @@ func TestSettleDeletesPublishedDeadLettersPoisonAndRetriesTransient(t *testing.T
 		t.Fatalf("expected only the published message to be deleted, got %+v", deletes)
 	}
 	parked := execsContaining(executor, "-- name: ParkClaimedOutboxMessages")
-	if len(parked) != 1 || !reflect.DeepEqual(parked[0].args[0], []string{"poison"}) {
+	if len(parked) != 1 || !reflect.DeepEqual(parked[0].args[2], []string{"poison"}) {
 		t.Fatalf("expected the poison message to be dead-lettered, got %+v", parked)
 	}
 	releases := execsContaining(executor, "next_attempt_at = CASE")
-	if len(releases) != 1 || !reflect.DeepEqual(releases[0].args[3], []string{"flaky"}) || releases[0].args[0] != false {
+	if len(releases) != 1 || !reflect.DeepEqual(releases[0].args[5], []string{"flaky"}) || releases[0].args[0] != false {
 		t.Fatalf("expected the transient failure to be released with backoff, got %+v", releases)
 	}
 }
@@ -326,7 +326,7 @@ func TestSettleDeadLettersTransientFailureAfterMaxAttempts(t *testing.T) {
 	if len(parked) != 1 {
 		t.Fatalf("expected exhausted message to be dead-lettered, got %+v", executor.execs)
 	}
-	if errs := parked[0].args[1].([]string); !strings.Contains(errs[0], "retry limit of 3 attempts exceeded") {
+	if errs := parked[0].args[3].([]string); !strings.Contains(errs[0], "retry limit of 3 attempts exceeded") {
 		t.Fatalf("expected retry limit reason, got %v", errs)
 	}
 	if len(execsContaining(executor, "next_attempt_at = CASE")) != 0 {
@@ -354,7 +354,7 @@ func TestSettleDeadLettersRowsThatCannotBeDecoded(t *testing.T) {
 
 	source.settle(context.Background(), claimed, nil)
 	parked := execsContaining(executor, "-- name: ParkClaimedOutboxMessages")
-	if len(parked) != 1 || !reflect.DeepEqual(parked[0].args[0], []string{"corrupt"}) {
+	if len(parked) != 1 || !reflect.DeepEqual(parked[0].args[2], []string{"corrupt"}) {
 		t.Fatalf("expected corrupt row to be dead-lettered, got %+v", parked)
 	}
 	deletes := execsContaining(executor, "DELETE FROM outbox_messages")
@@ -544,10 +544,10 @@ func TestSettleReportsDeadLetteredCountAndKeepsHealthyRowsFlowing(t *testing.T) 
 	source.settle(context.Background(), claimed, handlerErr)
 
 	deadLettered := execsContaining(executor, "-- name: ParkClaimedOutboxMessages")
-	if len(deadLettered) != 1 || !reflect.DeepEqual(deadLettered[0].args[0], []string{"poison"}) {
+	if len(deadLettered) != 1 || !reflect.DeepEqual(deadLettered[0].args[2], []string{"poison"}) {
 		t.Fatalf("expected the poison row to be dead-lettered in the table, got %+v", deadLettered)
 	}
-	if errs := deadLettered[0].args[1].([]string); !strings.Contains(errs[0], "rejected by broker") {
+	if errs := deadLettered[0].args[3].([]string); !strings.Contains(errs[0], "rejected by broker") {
 		t.Fatalf("expected the failure reason to be stored with the row, got %v", errs)
 	}
 	deletes := execsContaining(executor, "DELETE FROM outbox_messages")

@@ -48,7 +48,9 @@ SET claimed_by = NULL,
         ) * interval '1 millisecond'
     END,
     last_error = failure.error
-FROM unnest(sqlc.arg(ids)::text[], sqlc.arg(errors)::text[]) AS failure(id, error)
+FROM (
+    SELECT unnest(sqlc.arg(ids)::text[]) AS id, unnest(sqlc.arg(errors)::text[]) AS error
+) AS failure
 WHERE outbox.id = failure.id
   AND outbox.claimed_by = sqlc.arg(claimed_by)
   AND outbox.claim_token = sqlc.arg(claim_token)
@@ -73,7 +75,9 @@ SET claimed_by = NULL,
     next_attempt_at = NULL,
     dead_lettered_at = now(),
     last_error = failure.error
-FROM unnest(sqlc.arg(ids)::text[], sqlc.arg(errors)::text[]) AS failure(id, error)
+FROM (
+    SELECT unnest(sqlc.arg(ids)::text[]) AS id, unnest(sqlc.arg(errors)::text[]) AS error
+) AS failure
 WHERE outbox.id = failure.id
   AND outbox.claimed_by = sqlc.arg(claimed_by)
   AND outbox.claim_token = sqlc.arg(claim_token)
