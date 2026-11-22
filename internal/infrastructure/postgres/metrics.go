@@ -10,7 +10,7 @@ type Stats struct {
 	// OldestClaimableAge is the age of the oldest row that could be claimed
 	// now. A growing value means the forwarder is stuck or falling behind.
 	OldestClaimableAge time.Duration
-	// DeadLettered is the number of dead-lettered rows still in the table. Alert
+	// DeadLettered is the number of rows in the dead-letter table. Alert
 	// when it is above zero or grows.
 	DeadLettered int64
 }
@@ -19,8 +19,8 @@ type Stats struct {
 // must be safe for concurrent use and must not block. Wire it to Prometheus,
 // OpenTelemetry or any alerting system; the default implementation logs.
 type Metrics interface {
-	// DeadLettered reports rows that were moved to the dead-letter queue (the
-	// outbox table, with dead_lettered_at set).
+	// DeadLettered reports rows that were moved from the outbox to the
+	// dead-letter queue (the outbox_dead_letters table).
 	DeadLettered(count int)
 	// Snapshot reports the periodic table statistics.
 	Snapshot(stats Stats)

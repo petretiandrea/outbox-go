@@ -8,18 +8,29 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
-type OutboxMessage struct {
+type OutboxDeadLetter struct {
 	ID             string             `json:"id"`
 	Channel        string             `json:"channel"`
 	AffinityKey    pgtype.Text        `json:"affinity_key"`
 	Payload        []byte             `json:"payload"`
 	Metadata       []byte             `json:"metadata"`
 	OccurredAt     pgtype.Timestamptz `json:"occurred_at"`
-	ClaimedBy      pgtype.Text        `json:"claimed_by"`
-	ClaimedUntil   pgtype.Timestamptz `json:"claimed_until"`
 	Attempts       int32              `json:"attempts"`
 	LastError      pgtype.Text        `json:"last_error"`
-	ClaimToken     pgtype.Text        `json:"claim_token"`
-	NextAttemptAt  pgtype.Timestamptz `json:"next_attempt_at"`
 	DeadLetteredAt pgtype.Timestamptz `json:"dead_lettered_at"`
+}
+
+type OutboxMessage struct {
+	ID            string             `json:"id"`
+	Channel       string             `json:"channel"`
+	AffinityKey   pgtype.Text        `json:"affinity_key"`
+	Payload       []byte             `json:"payload"`
+	Metadata      []byte             `json:"metadata"`
+	OccurredAt    pgtype.Timestamptz `json:"occurred_at"`
+	ClaimedBy     pgtype.Text        `json:"claimed_by"`
+	ClaimedUntil  pgtype.Timestamptz `json:"claimed_until"`
+	Attempts      int32              `json:"attempts"`
+	LastError     pgtype.Text        `json:"last_error"`
+	ClaimToken    pgtype.Text        `json:"claim_token"`
+	NextAttemptAt pgtype.Timestamptz `json:"next_attempt_at"`
 }

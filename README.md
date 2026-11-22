@@ -132,34 +132,44 @@ A failure never stops the forwarder, and one bad row never blocks healthy rows:
 - **Permanent failures** (invalid message, unknown channel, metadata that cannot be decoded) are dead-lettered immediately. A transient failure is dead-lettered after `max_attempts` claims.
 - On shutdown, unfinished rows are released immediately and the interrupted attempt is not counted.
 
-Because rows are retried out of order after a failure, ordering across retries is not guaranteed (see below). Run with `initialize_schema: true` or apply migration `000004`, which adds `next_attempt_at` and `dead_lettered_at`.
+Because rows are retried out of order after a failure, ordering across retries is not guaranteed (see below). Run with `initialize_schema: true` or apply migration `000004`, which adds `next_attempt_at` to `outbox_messages` and creates the `outbox_dead_letters` table.
 
 #### Dead-letter queue
 
-The dead-letter queue (DLQ) is the `outbox_messages` table itself, so it adds no dependency on a broker and keeps working when every broker is down. A dead-lettered row stays in the table with `dead_lettered_at`, `attempts` and `last_error` set, together with its original channel, payload, affinity key and metadata. It is no longer claimed, and healthy rows keep flowing. Dead-lettering is a single database update, so a row is never lost or stuck half-way. Delivery of the original messages stays at-least-once.
+The dead-letter queue (DLQ) is the `outbox_dead_letters` table in the same database, so it adds no dependency on a broker and keeps working when every broker is down. A message that fails permanently, or exhausts `max_attempts`, is **moved** out of `outbox_messages` into `outbox_dead_letters` in a single SQL statement (delete plus insert), together with its failure details. The row is therefore never lost, never duplicated and never stuck half-way, it is never claimed again, and healthy rows keep flowing. Delivery of the original messages stays at-least-once.
 
-Inspect dead-lettered rows with:
+| Column | Meaning |
+| --- | --- |
+| `id`, `channel`, `affinity_key`, `payload`, `metadata`, `occurred_at` | The original message, unchanged. |
+| `attempts` | Publish attempts made before giving up. |
+| `last_error` | Why it was dead-lettered (truncated to 2000 bytes). |
+| `dead_lettered_at` | When it was moved. |
+
+Inspect it with:
 
 ```sql
 SELECT id, channel, attempts, last_error, dead_lettered_at
-FROM outbox_messages
-WHERE dead_lettered_at IS NOT NULL
+FROM outbox_dead_letters
 ORDER BY dead_lettered_at;
 ```
 
 #### Replaying dead-lettered messages
 
-After fixing the cause (for example configuring the missing channel), requeue rows by clearing the dead-letter state:
+After fixing the cause (for example configuring the missing channel), move the rows back to the outbox in one statement:
 
 ```sql
-UPDATE outbox_messages
-SET dead_lettered_at = NULL, attempts = 0, next_attempt_at = NULL, last_error = NULL
-WHERE id = '...';          -- or WHERE channel = '...' AND dead_lettered_at IS NOT NULL
+WITH replay AS (
+    DELETE FROM outbox_dead_letters
+    WHERE id = '...'          -- or WHERE channel = '...'
+    RETURNING id, channel, affinity_key, payload, metadata, occurred_at
+)
+INSERT INTO outbox_messages (id, channel, affinity_key, payload, metadata, occurred_at)
+SELECT id, channel, affinity_key, payload, metadata, occurred_at FROM replay;
 ```
 
-If the payload itself is wrong, fix it in the same `UPDATE`, or delete the row. A replayed message is delivered at-least-once, may arrive out of order relative to newer messages, and is dead-lettered again if it fails again. Consumers must deduplicate on `Message.ID`.
+If the payload itself is wrong, fix it in `outbox_dead_letters` first, or delete the row. A replayed message is delivered at-least-once, may arrive out of order relative to newer messages, and is dead-lettered again if it fails again. Consumers must deduplicate on `Message.ID`.
 
-Dead-lettered rows are kept until you delete them, for example `DELETE FROM outbox_messages WHERE dead_lettered_at < now() - interval '30 days'`.
+Dead-lettered rows are kept until you delete them, for example `DELETE FROM outbox_dead_letters WHERE dead_lettered_at < now() - interval '30 days'`.
 
 #### Metrics and alerting
 
@@ -168,7 +178,7 @@ The forwarder logs `outbox message dead-lettered` at error level for every row. 
 | Metric | Meaning |
 | --- | --- |
 | `outbox_dead_lettered_total` | Rows dead-lettered by this forwarder (a counter increment per event). |
-| `dead_lettered` | Rows currently dead-lettered in the table, sampled every 15s. Alert when it is above zero. |
+| `dead_lettered` | Rows currently in `outbox_dead_letters`, sampled every 15s. Alert when it is above zero. |
 | `oldest_claimable_age_seconds` | Age of the oldest row that could be claimed now, sampled every 15s. Alert when it keeps growing. |
 
 ### Ordering

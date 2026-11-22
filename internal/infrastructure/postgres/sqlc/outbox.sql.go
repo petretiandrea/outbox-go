@@ -15,8 +15,7 @@ const claimOutboxMessages = `-- name: ClaimOutboxMessages :many
 WITH candidate AS (
     SELECT id
     FROM outbox_messages
-    WHERE dead_lettered_at IS NULL
-      AND (claimed_until IS NULL OR claimed_until <= now())
+    WHERE (claimed_until IS NULL OR claimed_until <= now())
       AND (next_attempt_at IS NULL OR next_attempt_at <= now())
     ORDER BY occurred_at ASC, id ASC
     LIMIT $1
@@ -88,6 +87,49 @@ func (q *Queries) ClaimOutboxMessages(ctx context.Context, arg ClaimOutboxMessag
 	return items, nil
 }
 
+const deadLetterClaimedOutboxMessages = `-- name: DeadLetterClaimedOutboxMessages :execrows
+WITH moved AS (
+    DELETE FROM outbox_messages AS outbox
+    WHERE outbox.id = ANY($1::text[])
+      AND outbox.claimed_by = $2
+      AND outbox.claim_token = $3
+      AND outbox.claimed_until > now()
+    RETURNING outbox.id, outbox.channel, outbox.affinity_key, outbox.payload, outbox.metadata,
+              outbox.occurred_at, outbox.attempts, ($4::text[])[array_position($1::text[], outbox.id)] AS last_error
+)
+INSERT INTO outbox_dead_letters (id, channel, affinity_key, payload, metadata, occurred_at, attempts, last_error)
+SELECT id, channel, affinity_key, payload, metadata, occurred_at, attempts, last_error
+FROM moved
+ON CONFLICT (id) DO UPDATE
+SET attempts = EXCLUDED.attempts,
+    last_error = EXCLUDED.last_error,
+    dead_lettered_at = now()
+`
+
+type DeadLetterClaimedOutboxMessagesParams struct {
+	Ids        []string    `json:"ids"`
+	ClaimedBy  pgtype.Text `json:"claimed_by"`
+	ClaimToken pgtype.Text `json:"claim_token"`
+	Errors     []string    `json:"errors"`
+}
+
+// Moves rows that failed permanently or exhausted max_attempts from the outbox
+// to the dead-letter table in a single statement: they are deleted from
+// outbox_messages and inserted into outbox_dead_letters with the failure reason
+// atomically, so a row is never lost, duplicated or stuck half-way.
+func (q *Queries) DeadLetterClaimedOutboxMessages(ctx context.Context, arg DeadLetterClaimedOutboxMessagesParams) (int64, error) {
+	result, err := q.db.Exec(ctx, deadLetterClaimedOutboxMessages,
+		arg.Ids,
+		arg.ClaimedBy,
+		arg.ClaimToken,
+		arg.Errors,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const deleteClaimedOutboxMessages = `-- name: DeleteClaimedOutboxMessages :execrows
 DELETE FROM outbox_messages
 WHERE claimed_by = $1
@@ -113,11 +155,10 @@ func (q *Queries) DeleteClaimedOutboxMessages(ctx context.Context, arg DeleteCla
 const getOutboxStats = `-- name: GetOutboxStats :one
 SELECT
     COALESCE(EXTRACT(EPOCH FROM now() - (min(occurred_at) FILTER (
-        WHERE dead_lettered_at IS NULL
-          AND (claimed_until IS NULL OR claimed_until <= now())
+        WHERE (claimed_until IS NULL OR claimed_until <= now())
           AND (next_attempt_at IS NULL OR next_attempt_at <= now())
     ))), 0)::float8 AS oldest_claimable_age_seconds,
-    (count(*) FILTER (WHERE dead_lettered_at IS NOT NULL))::bigint AS dead_lettered_count
+    (SELECT count(*) FROM outbox_dead_letters)::bigint AS dead_lettered_count
 FROM outbox_messages
 `
 
@@ -133,46 +174,6 @@ func (q *Queries) GetOutboxStats(ctx context.Context) (GetOutboxStatsRow, error)
 	var i GetOutboxStatsRow
 	err := row.Scan(&i.OldestClaimableAgeSeconds, &i.DeadLetteredCount)
 	return i, err
-}
-
-const parkClaimedOutboxMessages = `-- name: ParkClaimedOutboxMessages :execrows
-UPDATE outbox_messages AS outbox
-SET claimed_by = NULL,
-    claim_token = NULL,
-    claimed_until = NULL,
-    next_attempt_at = NULL,
-    dead_lettered_at = now(),
-    last_error = failure.error
-FROM (
-    SELECT unnest($3::text[]) AS id, unnest($4::text[]) AS error
-) AS failure
-WHERE outbox.id = failure.id
-  AND outbox.claimed_by = $1
-  AND outbox.claim_token = $2
-  AND outbox.claimed_until > now()
-`
-
-type ParkClaimedOutboxMessagesParams struct {
-	ClaimedBy  pgtype.Text `json:"claimed_by"`
-	ClaimToken pgtype.Text `json:"claim_token"`
-	Ids        []string    `json:"ids"`
-	Errors     []string    `json:"errors"`
-}
-
-// Dead-letters rows that failed permanently or exhausted max_attempts: they
-// leave the claim queue and stay in the table with last_error and attempts
-// for inspection. To replay one, clear dead_lettered_at and reset attempts.
-func (q *Queries) ParkClaimedOutboxMessages(ctx context.Context, arg ParkClaimedOutboxMessagesParams) (int64, error) {
-	result, err := q.db.Exec(ctx, parkClaimedOutboxMessages,
-		arg.ClaimedBy,
-		arg.ClaimToken,
-		arg.Ids,
-		arg.Errors,
-	)
-	if err != nil {
-		return 0, err
-	}
-	return result.RowsAffected(), nil
 }
 
 const releaseClaimedOutboxMessages = `-- name: ReleaseClaimedOutboxMessages :execrows

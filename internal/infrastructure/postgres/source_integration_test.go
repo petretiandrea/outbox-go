@@ -156,32 +156,32 @@ func TestIntegrationPoisonRowIsDeadLetteredInTheTableAndHealthyRowsKeepFlowing(t
 
 	waitFor(t, "poison and flaky rows to be dead-lettered and healthy row deleted", func() bool {
 		var n int
-		_ = pool.QueryRow(ctx, `SELECT count(*) FROM outbox_messages WHERE dead_lettered_at IS NOT NULL`).Scan(&n)
+		_ = pool.QueryRow(ctx, `SELECT count(*) FROM outbox_dead_letters`).Scan(&n)
 		return n == 2 && published.Load() >= 1
 	})
 	cancel()
 	<-done
 
 	var attempts int
-	var lastError string
-	var claimedBy, claimToken *string
-	err := pool.QueryRow(context.Background(), `SELECT attempts, last_error, claimed_by, claim_token FROM outbox_messages WHERE id = 'poison'`).Scan(&attempts, &lastError, &claimedBy, &claimToken)
+	var lastError, channel string
+	var payload, metadata []byte
+	err := pool.QueryRow(context.Background(), `SELECT attempts, last_error, channel, payload, metadata FROM outbox_dead_letters WHERE id = 'poison'`).Scan(&attempts, &lastError, &channel, &payload, &metadata)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if lastError != "no publisher for channel unknown" || attempts != 1 || claimedBy != nil || claimToken != nil {
-		t.Fatalf("unexpected poison row: attempts=%d last_error=%q claimed_by=%v token=%v", attempts, lastError, claimedBy, claimToken)
+	if lastError != "no publisher for channel unknown" || attempts != 1 || channel != "unknown" || string(payload) != "{}" || string(metadata) != `{"k": "v"}` {
+		t.Fatalf("unexpected dead-lettered row: attempts=%d last_error=%q channel=%q payload=%q metadata=%q", attempts, lastError, channel, payload, metadata)
 	}
-	if err := pool.QueryRow(context.Background(), `SELECT attempts, last_error FROM outbox_messages WHERE id = 'flaky'`).Scan(&attempts, &lastError); err != nil {
+	if err := pool.QueryRow(context.Background(), `SELECT attempts, last_error FROM outbox_dead_letters WHERE id = 'flaky'`).Scan(&attempts, &lastError); err != nil {
 		t.Fatal(err)
 	}
 	if attempts != 3 || lastError == "" {
 		t.Fatalf("expected flaky row to be dead-lettered after 3 attempts, got attempts=%d last_error=%q", attempts, lastError)
 	}
-	var healthy int
-	_ = pool.QueryRow(context.Background(), `SELECT count(*) FROM outbox_messages WHERE id = 'healthy'`).Scan(&healthy)
-	if healthy != 0 {
-		t.Fatal("healthy row should have been deleted after publishing")
+	var remaining int
+	_ = pool.QueryRow(context.Background(), `SELECT count(*) FROM outbox_messages`).Scan(&remaining)
+	if remaining != 0 {
+		t.Fatalf("expected the outbox to be empty (published rows deleted, failed rows moved to the DLQ), got %d rows", remaining)
 	}
 	if got := metrics.deadLettered.Load(); got != 2 {
 		t.Fatalf("expected 2 dead-lettered reported, got %d", got)
@@ -215,19 +215,20 @@ func TestIntegrationDeadLetteredRowsCanBeReplayedWithSQL(t *testing.T) {
 	}()
 	waitFor(t, "row to be dead-lettered", func() bool {
 		var n int
-		_ = pool.QueryRow(ctx, `SELECT count(*) FROM outbox_messages WHERE dead_lettered_at IS NOT NULL`).Scan(&n)
+		_ = pool.QueryRow(ctx, `SELECT count(*) FROM outbox_dead_letters`).Scan(&n)
 		return n == 1
 	})
 
 	fail.Store(false)
 	// Replay statement documented in the README.
-	if _, err := pool.Exec(ctx, `UPDATE outbox_messages SET dead_lettered_at = NULL, attempts = 0, next_attempt_at = NULL, last_error = NULL WHERE id = 'm1'`); err != nil {
+	if _, err := pool.Exec(ctx, `WITH replay AS (DELETE FROM outbox_dead_letters WHERE id = 'm1' RETURNING id, channel, affinity_key, payload, metadata, occurred_at)
+		INSERT INTO outbox_messages (id, channel, affinity_key, payload, metadata, occurred_at) SELECT id, channel, affinity_key, payload, metadata, occurred_at FROM replay`); err != nil {
 		t.Fatal(err)
 	}
 	waitFor(t, "replayed row to be published", func() bool { return published.Load() == 1 })
 }
 
-func TestIntegrationMigrationAddsDeadLetterColumnsToAnExistingDatabase(t *testing.T) {
+func TestIntegrationMigrationAddsDeadLetterTableToAnExistingDatabase(t *testing.T) {
 	dsn := freshSchema(t, integrationDSN(t))
 	db, err := sql.Open("pgx", dsn)
 	if err != nil {
@@ -256,18 +257,18 @@ func TestIntegrationMigrationAddsDeadLetterColumnsToAnExistingDatabase(t *testin
 	if err := migrator.Up(); err != nil {
 		t.Fatalf("up to 000004: %v", err)
 	}
-	var deadLetteredAt, nextAttemptAt sql.NullTime
-	if err := db.QueryRow(`SELECT dead_lettered_at, next_attempt_at FROM outbox_messages WHERE id = 'existing'`).Scan(&deadLetteredAt, &nextAttemptAt); err != nil {
+	var nextAttemptAt sql.NullTime
+	if err := db.QueryRow(`SELECT next_attempt_at FROM outbox_messages WHERE id = 'existing'`).Scan(&nextAttemptAt); err != nil || nextAttemptAt.Valid {
 		t.Fatalf("existing rows must stay claimable after the migration: %v", err)
 	}
-	if deadLetteredAt.Valid || nextAttemptAt.Valid {
-		t.Fatal("existing rows must not be dead-lettered or delayed by the migration")
+	if _, err := db.Exec(`SELECT count(*) FROM outbox_dead_letters`); err != nil {
+		t.Fatalf("expected the dead-letter table to exist: %v", err)
 	}
 
 	if err := migrator.Steps(-1); err != nil {
 		t.Fatalf("down 000004: %v", err)
 	}
-	if _, err := db.Exec(`SELECT dead_lettered_at FROM outbox_messages`); err == nil {
-		t.Fatal("down migration must drop dead_lettered_at")
+	if _, err := db.Exec(`SELECT count(*) FROM outbox_dead_letters`); err == nil {
+		t.Fatal("down migration must drop the dead-letter table")
 	}
 }

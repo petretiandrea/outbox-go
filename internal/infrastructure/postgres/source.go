@@ -476,9 +476,9 @@ func (s *PollerSource) releaseMessages(ctx context.Context, claimToken string, i
 	return nil
 }
 
-// deadLetterMessages moves rows that failed permanently (or exhausted max_attempts)
-// out of the claim queue. They stay in the table, which is the dead-letter
-// queue, with last_error and attempts for inspection and replay.
+// deadLetterMessages moves rows that failed permanently (or exhausted
+// max_attempts) from the outbox table to the outbox_dead_letters table, with
+// the failure reason, in a single atomic statement.
 func (s *PollerSource) deadLetterMessages(ctx context.Context, claimToken string, items []failureDisposition) error {
 	if len(items) == 0 {
 		return nil
@@ -488,7 +488,7 @@ func (s *PollerSource) deadLetterMessages(ctx context.Context, claimToken string
 		s.log().Error("outbox message dead-lettered", "message_id", item.id, "error", item.err)
 	}
 
-	parked, err := s.queries.ParkClaimedOutboxMessages(ctx, postgresqlc.ParkClaimedOutboxMessagesParams{
+	moved, err := s.queries.DeadLetterClaimedOutboxMessages(ctx, postgresqlc.DeadLetterClaimedOutboxMessagesParams{
 		Ids:        ids,
 		Errors:     errs,
 		ClaimedBy:  requiredText(s.claimOwner),
@@ -497,8 +497,8 @@ func (s *PollerSource) deadLetterMessages(ctx context.Context, claimToken string
 	if err != nil {
 		return fmt.Errorf("dead-letter outbox messages: %w", err)
 	}
-	if parked != int64(len(ids)) {
-		return fmt.Errorf("dead-letter outbox messages: parked %d of %d claimed messages (claim was lost)", parked, len(ids))
+	if moved != int64(len(ids)) {
+		return fmt.Errorf("dead-letter outbox messages: moved %d of %d claimed messages (claim was lost)", moved, len(ids))
 	}
 	s.reportDeadLettered(len(ids))
 	return nil

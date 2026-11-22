@@ -2,8 +2,7 @@
 WITH candidate AS (
     SELECT id
     FROM outbox_messages
-    WHERE dead_lettered_at IS NULL
-      AND (claimed_until IS NULL OR claimed_until <= now())
+    WHERE (claimed_until IS NULL OR claimed_until <= now())
       AND (next_attempt_at IS NULL OR next_attempt_at <= now())
     ORDER BY occurred_at ASC, id ASC
     LIMIT sqlc.arg(batch_size)
@@ -64,33 +63,35 @@ WHERE claimed_by = sqlc.arg(claimed_by)
   AND claimed_until > now()
   AND id = ANY(sqlc.arg(ids)::text[]);
 
--- name: ParkClaimedOutboxMessages :execrows
--- Dead-letters rows that failed permanently or exhausted max_attempts: they
--- leave the claim queue and stay in the table with last_error and attempts
--- for inspection. To replay one, clear dead_lettered_at and reset attempts.
-UPDATE outbox_messages AS outbox
-SET claimed_by = NULL,
-    claim_token = NULL,
-    claimed_until = NULL,
-    next_attempt_at = NULL,
-    dead_lettered_at = now(),
-    last_error = failure.error
-FROM (
-    SELECT unnest(sqlc.arg(ids)::text[]) AS id, unnest(sqlc.arg(errors)::text[]) AS error
-) AS failure
-WHERE outbox.id = failure.id
-  AND outbox.claimed_by = sqlc.arg(claimed_by)
-  AND outbox.claim_token = sqlc.arg(claim_token)
-  AND outbox.claimed_until > now();
+-- name: DeadLetterClaimedOutboxMessages :execrows
+-- Moves rows that failed permanently or exhausted max_attempts from the outbox
+-- to the dead-letter table in a single statement: they are deleted from
+-- outbox_messages and inserted into outbox_dead_letters with the failure reason
+-- atomically, so a row is never lost, duplicated or stuck half-way.
+WITH moved AS (
+    DELETE FROM outbox_messages AS outbox
+    WHERE outbox.id = ANY(sqlc.arg(ids)::text[])
+      AND outbox.claimed_by = sqlc.arg(claimed_by)
+      AND outbox.claim_token = sqlc.arg(claim_token)
+      AND outbox.claimed_until > now()
+    RETURNING outbox.id, outbox.channel, outbox.affinity_key, outbox.payload, outbox.metadata,
+              outbox.occurred_at, outbox.attempts, (sqlc.arg(errors)::text[])[array_position(sqlc.arg(ids)::text[], outbox.id)] AS last_error
+)
+INSERT INTO outbox_dead_letters (id, channel, affinity_key, payload, metadata, occurred_at, attempts, last_error)
+SELECT id, channel, affinity_key, payload, metadata, occurred_at, attempts, last_error
+FROM moved
+ON CONFLICT (id) DO UPDATE
+SET attempts = EXCLUDED.attempts,
+    last_error = EXCLUDED.last_error,
+    dead_lettered_at = now();
 
 -- name: GetOutboxStats :one
 -- Operational snapshot for alerting. oldest_claimable_age_seconds is the age of
 -- the oldest row that could be claimed right now (0 when there is none).
 SELECT
     COALESCE(EXTRACT(EPOCH FROM now() - (min(occurred_at) FILTER (
-        WHERE dead_lettered_at IS NULL
-          AND (claimed_until IS NULL OR claimed_until <= now())
+        WHERE (claimed_until IS NULL OR claimed_until <= now())
           AND (next_attempt_at IS NULL OR next_attempt_at <= now())
     ))), 0)::float8 AS oldest_claimable_age_seconds,
-    (count(*) FILTER (WHERE dead_lettered_at IS NOT NULL))::bigint AS dead_lettered_count
+    (SELECT count(*) FROM outbox_dead_letters)::bigint AS dead_lettered_count
 FROM outbox_messages;

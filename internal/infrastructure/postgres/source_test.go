@@ -297,12 +297,12 @@ func TestSettleDeletesPublishedDeadLettersPoisonAndRetriesTransient(t *testing.T
 
 	source.settle(context.Background(), claimed, handlerErr)
 
-	deletes := execsContaining(executor, "DELETE FROM outbox_messages")
+	deletes := execsContaining(executor, "-- name: DeleteClaimedOutboxMessages")
 	if len(deletes) != 1 || !reflect.DeepEqual(deletes[0].args[2], []string{"ok"}) {
 		t.Fatalf("expected only the published message to be deleted, got %+v", deletes)
 	}
-	parked := execsContaining(executor, "-- name: ParkClaimedOutboxMessages")
-	if len(parked) != 1 || !reflect.DeepEqual(parked[0].args[2], []string{"poison"}) {
+	parked := execsContaining(executor, "-- name: DeadLetterClaimedOutboxMessages")
+	if len(parked) != 1 || !reflect.DeepEqual(parked[0].args[0], []string{"poison"}) {
 		t.Fatalf("expected the poison message to be dead-lettered, got %+v", parked)
 	}
 	releases := execsContaining(executor, "next_attempt_at = CASE")
@@ -322,7 +322,7 @@ func TestSettleDeadLettersTransientFailureAfterMaxAttempts(t *testing.T) {
 
 	source.settle(context.Background(), claimed, errors.New("broker unavailable"))
 
-	parked := execsContaining(executor, "-- name: ParkClaimedOutboxMessages")
+	parked := execsContaining(executor, "-- name: DeadLetterClaimedOutboxMessages")
 	if len(parked) != 1 {
 		t.Fatalf("expected exhausted message to be dead-lettered, got %+v", executor.execs)
 	}
@@ -353,11 +353,11 @@ func TestSettleDeadLettersRowsThatCannotBeDecoded(t *testing.T) {
 	}
 
 	source.settle(context.Background(), claimed, nil)
-	parked := execsContaining(executor, "-- name: ParkClaimedOutboxMessages")
-	if len(parked) != 1 || !reflect.DeepEqual(parked[0].args[2], []string{"corrupt"}) {
+	parked := execsContaining(executor, "-- name: DeadLetterClaimedOutboxMessages")
+	if len(parked) != 1 || !reflect.DeepEqual(parked[0].args[0], []string{"corrupt"}) {
 		t.Fatalf("expected corrupt row to be dead-lettered, got %+v", parked)
 	}
-	deletes := execsContaining(executor, "DELETE FROM outbox_messages")
+	deletes := execsContaining(executor, "-- name: DeleteClaimedOutboxMessages")
 	if len(deletes) != 1 || !reflect.DeepEqual(deletes[0].args[2], []string{"healthy"}) {
 		t.Fatalf("expected healthy row to be deleted, got %+v", deletes)
 	}
@@ -394,7 +394,7 @@ func TestSubscribeKeepsRunningAfterClaimAndHandlerErrors(t *testing.T) {
 	if len(execsContaining(executor, "next_attempt_at = CASE")) == 0 {
 		t.Fatal("expected the failed message to be released with backoff")
 	}
-	deletes := execsContaining(executor, "DELETE FROM outbox_messages")
+	deletes := execsContaining(executor, "-- name: DeleteClaimedOutboxMessages")
 	if len(deletes) != 1 || !reflect.DeepEqual(deletes[0].args[2], []string{"healthy"}) {
 		t.Fatalf("expected healthy message to be deleted, got %+v", deletes)
 	}
@@ -543,14 +543,14 @@ func TestSettleReportsDeadLetteredCountAndKeepsHealthyRowsFlowing(t *testing.T) 
 
 	source.settle(context.Background(), claimed, handlerErr)
 
-	deadLettered := execsContaining(executor, "-- name: ParkClaimedOutboxMessages")
-	if len(deadLettered) != 1 || !reflect.DeepEqual(deadLettered[0].args[2], []string{"poison"}) {
+	deadLettered := execsContaining(executor, "-- name: DeadLetterClaimedOutboxMessages")
+	if len(deadLettered) != 1 || !reflect.DeepEqual(deadLettered[0].args[0], []string{"poison"}) {
 		t.Fatalf("expected the poison row to be dead-lettered in the table, got %+v", deadLettered)
 	}
 	if errs := deadLettered[0].args[3].([]string); !strings.Contains(errs[0], "rejected by broker") {
 		t.Fatalf("expected the failure reason to be stored with the row, got %v", errs)
 	}
-	deletes := execsContaining(executor, "DELETE FROM outbox_messages")
+	deletes := execsContaining(executor, "-- name: DeleteClaimedOutboxMessages")
 	if len(deletes) != 1 || !reflect.DeepEqual(deletes[0].args[2], []string{"ok"}) {
 		t.Fatalf("healthy rows must still be deleted, got %+v", deletes)
 	}

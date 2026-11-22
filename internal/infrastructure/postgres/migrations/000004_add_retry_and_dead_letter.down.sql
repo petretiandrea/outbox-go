@@ -1,6 +1,4 @@
-DROP INDEX IF EXISTS idx_outbox_messages_dead_lettered;
-DROP INDEX IF EXISTS idx_outbox_messages_claimable;
+DROP TABLE IF EXISTS outbox_dead_letters;
 
 ALTER TABLE outbox_messages
-    DROP COLUMN IF EXISTS dead_lettered_at,
     DROP COLUMN IF EXISTS next_attempt_at;
