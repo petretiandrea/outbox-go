@@ -112,13 +112,28 @@ Fields:
 | `poll_interval` | no | Delay when no messages are found. Default is `1s`. |
 | `claim_lease` | no | How long a forwarder owns a claimed batch before another forwarder can retry it. Default is `30s`; positive values below `1ms` are rejected. |
 | `claim_owner` | no | Identifier stored in claimed rows. Default is generated from hostname and process id. Every acquired batch also receives a unique internal claim token, so owners may safely be reused. |
+| `max_attempts` | no | Claims allowed before a repeatedly failing message is quarantined. Default is `20`; a negative value retries forever. |
+| `retry_backoff` | no | Delay before the first retry of a failed message; doubles on each further attempt. Default is `1s`. |
+| `max_retry_backoff` | no | Upper bound for the retry delay. Default is `5m`; must not be below `retry_backoff`. |
 | `initialize_schema` | no | If `true`, runs embedded PostgreSQL migrations during startup before subscribing. Default is `false`. |
 
 `initialize_schema` is executed before the first subscribe loop. If schema initialization fails, the service fails fast and does not start processing.
 
 The PostgreSQL source and embedded schema initialization use the `outbox_messages` table.
 
-The PostgreSQL source claims rows before publishing and deletes them only after the publish succeeds. Each claim has a random token; delete, release, and renewal require both the configured owner and that token. The source renews a claim while its handler is running. If publishing fails, the claim is released with its token and the row can be retried. If the process crashes after publishing but before delete, or a lease renewal cannot reach PostgreSQL, the message can still be published again after the lease expires. Consumers must therefore treat delivery as at-least-once and use `Message.ID` for idempotency.
+The PostgreSQL source claims rows before publishing and deletes them only after the publish succeeds. Each claim has a random token; delete, release, and renewal require both the configured owner and that token. The source renews a claim while its handler is running. If publishing fails, the claim is released with its token and the row is retried with backoff (see below). If the process crashes after publishing but before delete, or a lease renewal cannot reach PostgreSQL, the message can still be published again after the lease expires. Consumers must therefore treat delivery as at-least-once and use `Message.ID` for idempotency.
+
+### Failures, retries and quarantine
+
+A failure never stops the forwarder, and one bad row never blocks healthy rows:
+
+- **Per-message outcomes.** Messages are published per channel. Rows whose channel published successfully are deleted even if another channel in the same batch failed; only the failed rows are kept. A batch is therefore no longer republished as a whole after a partial failure. A crash between publishing and deleting can still republish a row, so delivery stays at-least-once.
+- **Transient failures** (broker unavailable, timeouts, any publisher error not marked permanent) release the row with exponential backoff (`retry_backoff` up to `max_retry_backoff`, tracked in `next_attempt_at`). Other rows are claimed in the meantime. When the broker recovers the forwarder resumes by itself; no restart is needed. Database errors while claiming or completing are logged and retried with backoff too.
+- **Permanent failures** (invalid message, unknown channel, metadata that cannot be decoded) are quarantined immediately. A transient failure is quarantined after `max_attempts` claims.
+- **Quarantine.** A quarantined row stays in `outbox_messages` with `quarantined_at`, `attempts` and `last_error` set, and is no longer claimed. Inspect them with `SELECT id, channel, attempts, last_error FROM outbox_messages WHERE quarantined_at IS NOT NULL`. After fixing the cause (for example configuring the missing channel), requeue with `UPDATE outbox_messages SET quarantined_at = NULL, attempts = 0, next_attempt_at = NULL WHERE id = ...`, or delete the row.
+- On shutdown, unfinished rows are released immediately and the interrupted attempt is not counted.
+
+Because rows are retried out of order after a failure, ordering across retries is not guaranteed (see below). Run with `initialize_schema: true` or apply migration `000004` to add the `next_attempt_at` and `quarantined_at` columns.
 
 ### Ordering
 
