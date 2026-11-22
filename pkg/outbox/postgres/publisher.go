@@ -38,6 +38,10 @@ func NewPublisher(db sqlExecutor, config PublisherConfig) (*Publisher, error) {
 	if tableName == "" {
 		tableName = defaultTableName
 	}
+	tableName, err := quoteTableName(tableName)
+	if err != nil {
+		return nil, err
+	}
 
 	publisher := &Publisher{
 		executor:  db,
