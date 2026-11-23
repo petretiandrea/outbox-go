@@ -20,7 +20,7 @@ jobs:
                   fetch-depth: 0 # IMPORTANT: serve tutta la history
 
             - name: Run TruffleHog
-              uses: trufflesecurity/trufflehog@v3.100.0
+              uses: trufflesecurity/trufflehog@v3.100.1
               with:
                   path: .
                   base: ""
