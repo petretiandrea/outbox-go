@@ -181,14 +181,14 @@ func TestReleaseMessagesClearsClaimStoresErrorAndBacksOff(t *testing.T) {
 	if !strings.Contains(executor.execSQL, "claimed_by = NULL") || !strings.Contains(executor.execSQL, "next_attempt_at") {
 		t.Fatalf("expected release query to clear claim and schedule a retry, got %s", executor.execSQL)
 	}
-	if !strings.Contains(executor.execSQL, "outbox.claim_token = $7") {
+	if !strings.Contains(executor.execSQL, "outbox.claim_token = $5") {
 		t.Fatalf("expected release to fence by token, got %s", executor.execSQL)
 	}
 	if executor.execArgs[0] != false || executor.execArgs[1] != int64(60000) || executor.execArgs[2] != int64(1000) {
 		t.Fatalf("unexpected backoff args: %v", executor.execArgs[:3])
 	}
-	if errs, _ := executor.execArgs[4].([]string); len(errs) != 1 || errs[0] != "publish failed" {
-		t.Fatalf("expected last_error arg, got %v", executor.execArgs[4])
+	if errs, _ := executor.execArgs[6].([]string); len(errs) != 1 || errs[0] != "publish failed" {
+		t.Fatalf("expected last_error arg, got %v", executor.execArgs[6])
 	}
 }
 
@@ -250,7 +250,7 @@ func TestSubscribeReleasesClaimAfterCancellationUsingCleanupContext(t *testing.T
 	if executor.execCtx == nil || !executor.execContextWasLive {
 		t.Fatal("expected release to use a live cleanup context after cancellation")
 	}
-	if !strings.Contains(executor.execSQL, "outbox.claim_token = $7") {
+	if !strings.Contains(executor.execSQL, "outbox.claim_token = $5") {
 		t.Fatalf("expected release to fence by claim token, got %s", executor.execSQL)
 	}
 	if executor.execArgs[0] != true {
@@ -282,7 +282,7 @@ func execsContaining(executor *fakeExecutor, fragment string) []execCall {
 	return out
 }
 
-func TestSettleDeletesPublishedQuarantinesPoisonAndRetriesTransient(t *testing.T) {
+func TestSettleDeletesPublishedDeadLettersPoisonAndRetriesTransient(t *testing.T) {
 	executor := &fakeExecutor{commandTag: pgconn.NewCommandTag("UPDATE 1")}
 	source := newTestSource(executor)
 	claimed := claimedBatch{
@@ -297,21 +297,21 @@ func TestSettleDeletesPublishedQuarantinesPoisonAndRetriesTransient(t *testing.T
 
 	source.settle(context.Background(), claimed, handlerErr)
 
-	deletes := execsContaining(executor, "DELETE FROM outbox_messages")
+	deletes := execsContaining(executor, "-- name: DeleteClaimedOutboxMessages")
 	if len(deletes) != 1 || !reflect.DeepEqual(deletes[0].args[2], []string{"ok"}) {
 		t.Fatalf("expected only the published message to be deleted, got %+v", deletes)
 	}
-	quarantines := execsContaining(executor, "quarantined_at = now()")
-	if len(quarantines) != 1 || !reflect.DeepEqual(quarantines[0].args[0], []string{"poison"}) {
-		t.Fatalf("expected the poison message to be quarantined, got %+v", quarantines)
+	parked := execsContaining(executor, "-- name: DeadLetterClaimedOutboxMessages")
+	if len(parked) != 1 || !reflect.DeepEqual(parked[0].args[0], []string{"poison"}) {
+		t.Fatalf("expected the poison message to be dead-lettered, got %+v", parked)
 	}
 	releases := execsContaining(executor, "next_attempt_at = CASE")
-	if len(releases) != 1 || !reflect.DeepEqual(releases[0].args[3], []string{"flaky"}) || releases[0].args[0] != false {
+	if len(releases) != 1 || !reflect.DeepEqual(releases[0].args[5], []string{"flaky"}) || releases[0].args[0] != false {
 		t.Fatalf("expected the transient failure to be released with backoff, got %+v", releases)
 	}
 }
 
-func TestSettleQuarantinesTransientFailureAfterMaxAttempts(t *testing.T) {
+func TestSettleDeadLettersTransientFailureAfterMaxAttempts(t *testing.T) {
 	executor := &fakeExecutor{commandTag: pgconn.NewCommandTag("UPDATE 1")}
 	source := newTestSource(executor)
 	claimed := claimedBatch{
@@ -322,11 +322,11 @@ func TestSettleQuarantinesTransientFailureAfterMaxAttempts(t *testing.T) {
 
 	source.settle(context.Background(), claimed, errors.New("broker unavailable"))
 
-	quarantines := execsContaining(executor, "quarantined_at = now()")
-	if len(quarantines) != 1 {
-		t.Fatalf("expected exhausted message to be quarantined, got %+v", executor.execs)
+	parked := execsContaining(executor, "-- name: DeadLetterClaimedOutboxMessages")
+	if len(parked) != 1 {
+		t.Fatalf("expected exhausted message to be dead-lettered, got %+v", executor.execs)
 	}
-	if errs := quarantines[0].args[1].([]string); !strings.Contains(errs[0], "retry limit of 3 attempts exceeded") {
+	if errs := parked[0].args[3].([]string); !strings.Contains(errs[0], "retry limit of 3 attempts exceeded") {
 		t.Fatalf("expected retry limit reason, got %v", errs)
 	}
 	if len(execsContaining(executor, "next_attempt_at = CASE")) != 0 {
@@ -334,7 +334,7 @@ func TestSettleQuarantinesTransientFailureAfterMaxAttempts(t *testing.T) {
 	}
 }
 
-func TestSettleQuarantinesRowsThatCannotBeDecoded(t *testing.T) {
+func TestSettleDeadLettersRowsThatCannotBeDecoded(t *testing.T) {
 	executor := &fakeExecutor{commandTag: pgconn.NewCommandTag("UPDATE 1"), rows: rows(
 		rowRecord{id: "corrupt", channel: "orders.created", payload: []byte("p"), metadata: []byte("{not json"), occurredAt: time.Now(), attempts: 1},
 		record("healthy", 1),
@@ -353,11 +353,11 @@ func TestSettleQuarantinesRowsThatCannotBeDecoded(t *testing.T) {
 	}
 
 	source.settle(context.Background(), claimed, nil)
-	quarantines := execsContaining(executor, "quarantined_at = now()")
-	if len(quarantines) != 1 || !reflect.DeepEqual(quarantines[0].args[0], []string{"corrupt"}) {
-		t.Fatalf("expected corrupt row to be quarantined, got %+v", quarantines)
+	parked := execsContaining(executor, "-- name: DeadLetterClaimedOutboxMessages")
+	if len(parked) != 1 || !reflect.DeepEqual(parked[0].args[0], []string{"corrupt"}) {
+		t.Fatalf("expected corrupt row to be dead-lettered, got %+v", parked)
 	}
-	deletes := execsContaining(executor, "DELETE FROM outbox_messages")
+	deletes := execsContaining(executor, "-- name: DeleteClaimedOutboxMessages")
 	if len(deletes) != 1 || !reflect.DeepEqual(deletes[0].args[2], []string{"healthy"}) {
 		t.Fatalf("expected healthy row to be deleted, got %+v", deletes)
 	}
@@ -394,7 +394,7 @@ func TestSubscribeKeepsRunningAfterClaimAndHandlerErrors(t *testing.T) {
 	if len(execsContaining(executor, "next_attempt_at = CASE")) == 0 {
 		t.Fatal("expected the failed message to be released with backoff")
 	}
-	deletes := execsContaining(executor, "DELETE FROM outbox_messages")
+	deletes := execsContaining(executor, "-- name: DeleteClaimedOutboxMessages")
 	if len(deletes) != 1 || !reflect.DeepEqual(deletes[0].args[2], []string{"healthy"}) {
 		t.Fatalf("expected healthy message to be deleted, got %+v", deletes)
 	}
@@ -519,3 +519,62 @@ func (r *fakeRows) Values() ([]any, error) { return nil, nil }
 func (r *fakeRows) RawValues() [][]byte { return nil }
 
 func (r *fakeRows) Conn() *pgx.Conn { return nil }
+
+type recordingMetrics struct {
+	deadLettered int
+}
+
+func (m *recordingMetrics) DeadLettered(count int) { m.deadLettered += count }
+func (m *recordingMetrics) Snapshot(Stats)         {}
+
+func TestSettleReportsDeadLetteredCountAndKeepsHealthyRowsFlowing(t *testing.T) {
+	executor := &fakeExecutor{commandTag: pgconn.NewCommandTag("UPDATE 1")}
+	source := newTestSource(executor)
+	metrics := &recordingMetrics{}
+	source.metrics = metrics
+	claimed := claimedBatch{
+		claimToken: "claim-1",
+		messages:   []outbox.Message{{ID: "ok"}, {ID: "poison"}},
+		attempts:   map[string]int32{"ok": 1, "poison": 2},
+	}
+	handlerErr := &domain.BatchError{Failures: []domain.MessageFailure{
+		{ID: "poison", Err: domain.Permanent(errors.New("rejected by broker"))},
+	}}
+
+	source.settle(context.Background(), claimed, handlerErr)
+
+	deadLettered := execsContaining(executor, "-- name: DeadLetterClaimedOutboxMessages")
+	if len(deadLettered) != 1 || !reflect.DeepEqual(deadLettered[0].args[0], []string{"poison"}) {
+		t.Fatalf("expected the poison row to be dead-lettered in the table, got %+v", deadLettered)
+	}
+	if errs := deadLettered[0].args[3].([]string); !strings.Contains(errs[0], "rejected by broker") {
+		t.Fatalf("expected the failure reason to be stored with the row, got %v", errs)
+	}
+	deletes := execsContaining(executor, "-- name: DeleteClaimedOutboxMessages")
+	if len(deletes) != 1 || !reflect.DeepEqual(deletes[0].args[2], []string{"ok"}) {
+		t.Fatalf("healthy rows must still be deleted, got %+v", deletes)
+	}
+	if metrics.deadLettered != 1 {
+		t.Fatalf("expected one dead-lettered row to be reported, got %d", metrics.deadLettered)
+	}
+}
+
+func TestSettleDoesNotReportDeadLetteredWhenClaimWasLost(t *testing.T) {
+	executor := &fakeExecutor{commandTag: pgconn.NewCommandTag("UPDATE 0")}
+	source := newTestSource(executor)
+	metrics := &recordingMetrics{}
+	source.metrics = metrics
+	claimed := claimedBatch{
+		claimToken: "claim-1",
+		messages:   []outbox.Message{{ID: "poison"}},
+		attempts:   map[string]int32{"poison": 1},
+	}
+
+	source.settle(context.Background(), claimed, &domain.BatchError{Failures: []domain.MessageFailure{
+		{ID: "poison", Err: domain.Permanent(errors.New("rejected by broker"))},
+	}})
+
+	if metrics.deadLettered != 0 {
+		t.Fatalf("a lost claim must not be reported as dead-lettered, got %d", metrics.deadLettered)
+	}
+}

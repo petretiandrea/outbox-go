@@ -14,7 +14,7 @@ type permanentError struct{ err error }
 func (e *permanentError) Error() string { return e.err.Error() }
 func (e *permanentError) Unwrap() error { return e.err }
 
-// Permanent marks err as a permanent failure. Sources quarantine messages that
+// Permanent marks err as a permanent failure. Sources dead-letter messages that
 // fail permanently instead of retrying them. Untagged errors are transient.
 func Permanent(err error) error {
 	if err == nil {

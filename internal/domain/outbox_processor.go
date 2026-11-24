@@ -38,10 +38,7 @@ func NewOutboxProcessor(config OutboxProcessorConfig) (*OutboxProcessor, error) 
 		publishers[channel] = publisher
 	}
 
-	return &OutboxProcessor{
-		source:     config.Source,
-		publishers: publishers,
-	}, nil
+	return &OutboxProcessor{source: config.Source, publishers: publishers}, nil
 }
 
 func (p *OutboxProcessor) Process(ctx context.Context) error {
@@ -70,7 +67,7 @@ func (p *OutboxProcessor) Close() error {
 // invalid or target an unknown channel fail permanently without affecting the
 // rest of the batch; a failing channel only fails its own messages. The
 // returned *BatchError lists every failed message so the source can delete the
-// published ones, quarantine poison records and retry transient failures.
+// published ones, dead-letter poison records and retry transient failures.
 func (p *OutboxProcessor) handleMessages(ctx context.Context, messages ...*outbox.Message) error {
 	grouped := make(map[outbox.Channel][]outbox.Message)
 	var failures []MessageFailure

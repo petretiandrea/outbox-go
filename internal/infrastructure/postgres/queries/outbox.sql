@@ -2,8 +2,7 @@
 WITH candidate AS (
     SELECT id
     FROM outbox_messages
-    WHERE quarantined_at IS NULL
-      AND (claimed_until IS NULL OR claimed_until <= now())
+    WHERE (claimed_until IS NULL OR claimed_until <= now())
       AND (next_attempt_at IS NULL OR next_attempt_at <= now())
     ORDER BY occurred_at ASC, id ASC
     LIMIT sqlc.arg(batch_size)
@@ -14,7 +13,7 @@ claimed AS (
     SET claimed_by = sqlc.arg(claimed_by),
         claim_token = sqlc.arg(claim_token),
         claimed_until = now() + (sqlc.arg(claim_lease_milliseconds)::bigint * interval '1 millisecond'),
-        attempts = attempts + 1,
+        attempts = outbox.attempts + 1,
         last_error = NULL
     FROM candidate
     WHERE outbox.id = candidate.id
@@ -48,23 +47,9 @@ SET claimed_by = NULL,
         ) * interval '1 millisecond'
     END,
     last_error = failure.error
-FROM unnest(sqlc.arg(ids)::text[], sqlc.arg(errors)::text[]) AS failure(id, error)
-WHERE outbox.id = failure.id
-  AND outbox.claimed_by = sqlc.arg(claimed_by)
-  AND outbox.claim_token = sqlc.arg(claim_token)
-  AND outbox.claimed_until > now();
-
--- name: QuarantineClaimedOutboxMessages :execrows
--- Moves poison rows out of the claim queue. They stay in the table with
--- last_error and attempts for inspection; clear quarantined_at to retry them.
-UPDATE outbox_messages AS outbox
-SET claimed_by = NULL,
-    claim_token = NULL,
-    claimed_until = NULL,
-    next_attempt_at = NULL,
-    quarantined_at = now(),
-    last_error = failure.error
-FROM unnest(sqlc.arg(ids)::text[], sqlc.arg(errors)::text[]) AS failure(id, error)
+FROM (
+    SELECT unnest(sqlc.arg(ids)::text[]) AS id, unnest(sqlc.arg(errors)::text[]) AS error
+) AS failure
 WHERE outbox.id = failure.id
   AND outbox.claimed_by = sqlc.arg(claimed_by)
   AND outbox.claim_token = sqlc.arg(claim_token)
@@ -77,3 +62,36 @@ WHERE claimed_by = sqlc.arg(claimed_by)
   AND claim_token = sqlc.arg(claim_token)
   AND claimed_until > now()
   AND id = ANY(sqlc.arg(ids)::text[]);
+
+-- name: DeadLetterClaimedOutboxMessages :execrows
+-- Moves rows that failed permanently or exhausted max_attempts from the outbox
+-- to the dead-letter table in a single statement: they are deleted from
+-- outbox_messages and inserted into outbox_dead_letters with the failure reason
+-- atomically, so a row is never lost, duplicated or stuck half-way.
+WITH moved AS (
+    DELETE FROM outbox_messages AS outbox
+    WHERE outbox.id = ANY(sqlc.arg(ids)::text[])
+      AND outbox.claimed_by = sqlc.arg(claimed_by)
+      AND outbox.claim_token = sqlc.arg(claim_token)
+      AND outbox.claimed_until > now()
+    RETURNING outbox.id, outbox.channel, outbox.affinity_key, outbox.payload, outbox.metadata,
+              outbox.occurred_at, outbox.attempts, (sqlc.arg(errors)::text[])[array_position(sqlc.arg(ids)::text[], outbox.id)] AS last_error
+)
+INSERT INTO outbox_dead_letters (id, channel, affinity_key, payload, metadata, occurred_at, attempts, last_error)
+SELECT id, channel, affinity_key, payload, metadata, occurred_at, attempts, last_error
+FROM moved
+ON CONFLICT (id) DO UPDATE
+SET attempts = EXCLUDED.attempts,
+    last_error = EXCLUDED.last_error,
+    dead_lettered_at = now();
+
+-- name: GetOutboxStats :one
+-- Operational snapshot for alerting. oldest_claimable_age_seconds is the age of
+-- the oldest row that could be claimed right now (0 when there is none).
+SELECT
+    COALESCE(EXTRACT(EPOCH FROM now() - (min(occurred_at) FILTER (
+        WHERE (claimed_until IS NULL OR claimed_until <= now())
+          AND (next_attempt_at IS NULL OR next_attempt_at <= now())
+    ))), 0)::float8 AS oldest_claimable_age_seconds,
+    (SELECT count(*) FROM outbox_dead_letters)::bigint AS dead_lettered_count
+FROM outbox_messages;

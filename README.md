@@ -112,7 +112,7 @@ Fields:
 | `poll_interval` | no | Delay when no messages are found. Default is `1s`. |
 | `claim_lease` | no | How long a forwarder owns a claimed batch before another forwarder can retry it. Default is `30s`; positive values below `1ms` are rejected. |
 | `claim_owner` | no | Identifier stored in claimed rows. Default is generated from hostname and process id. Every acquired batch also receives a unique internal claim token, so owners may safely be reused. |
-| `max_attempts` | no | Claims allowed before a repeatedly failing message is quarantined. Default is `20`; a negative value retries forever. |
+| `max_attempts` | no | Claims allowed before a repeatedly failing message is dead-lettered. Default is `20`; a negative value retries forever. |
 | `retry_backoff` | no | Delay before the first retry of a failed message; doubles on each further attempt. Default is `1s`. |
 | `max_retry_backoff` | no | Upper bound for the retry delay. Default is `5m`; must not be below `retry_backoff`. |
 | `initialize_schema` | no | If `true`, runs embedded PostgreSQL migrations during startup before subscribing. Default is `false`. |
@@ -123,17 +123,63 @@ The PostgreSQL source and embedded schema initialization use the `outbox_message
 
 The PostgreSQL source claims rows before publishing and deletes them only after the publish succeeds. Each claim has a random token; delete, release, and renewal require both the configured owner and that token. The source renews a claim while its handler is running. If publishing fails, the claim is released with its token and the row is retried with backoff (see below). If the process crashes after publishing but before delete, or a lease renewal cannot reach PostgreSQL, the message can still be published again after the lease expires. Consumers must therefore treat delivery as at-least-once and use `Message.ID` for idempotency.
 
-### Failures, retries and quarantine
+### Failures, retries and dead letters
 
 A failure never stops the forwarder, and one bad row never blocks healthy rows:
 
-- **Per-message outcomes.** Messages are published per channel. Rows whose channel published successfully are deleted even if another channel in the same batch failed; only the failed rows are kept. A batch is therefore no longer republished as a whole after a partial failure. A crash between publishing and deleting can still republish a row, so delivery stays at-least-once.
+- **Per-message outcomes.** Messages are published per channel. Rows whose channel published successfully are deleted even if another channel in the same batch failed; only the failed rows are kept. A crash between publishing and deleting can still republish a row, so delivery stays at-least-once.
 - **Transient failures** (broker unavailable, timeouts, any publisher error not marked permanent) release the row with exponential backoff (`retry_backoff` up to `max_retry_backoff`, tracked in `next_attempt_at`). Other rows are claimed in the meantime. When the broker recovers the forwarder resumes by itself; no restart is needed. Database errors while claiming or completing are logged and retried with backoff too.
-- **Permanent failures** (invalid message, unknown channel, metadata that cannot be decoded) are quarantined immediately. A transient failure is quarantined after `max_attempts` claims.
-- **Quarantine.** A quarantined row stays in `outbox_messages` with `quarantined_at`, `attempts` and `last_error` set, and is no longer claimed. Inspect them with `SELECT id, channel, attempts, last_error FROM outbox_messages WHERE quarantined_at IS NOT NULL`. After fixing the cause (for example configuring the missing channel), requeue with `UPDATE outbox_messages SET quarantined_at = NULL, attempts = 0, next_attempt_at = NULL WHERE id = ...`, or delete the row.
+- **Permanent failures** (invalid message, unknown channel, metadata that cannot be decoded) are dead-lettered immediately. A transient failure is dead-lettered after `max_attempts` claims.
 - On shutdown, unfinished rows are released immediately and the interrupted attempt is not counted.
 
-Because rows are retried out of order after a failure, ordering across retries is not guaranteed (see below). Run with `initialize_schema: true` or apply migration `000004` to add the `next_attempt_at` and `quarantined_at` columns.
+Because rows are retried out of order after a failure, ordering across retries is not guaranteed (see below). Run with `initialize_schema: true` or apply migration `000004`, which adds `next_attempt_at` to `outbox_messages` and creates the `outbox_dead_letters` table.
+
+#### Dead-letter queue
+
+The dead-letter queue (DLQ) is the `outbox_dead_letters` table in the same database, so it adds no dependency on a broker and keeps working when every broker is down. A message that fails permanently, or exhausts `max_attempts`, is **moved** out of `outbox_messages` into `outbox_dead_letters` in a single SQL statement (delete plus insert), together with its failure details. The row is therefore never lost, never duplicated and never stuck half-way, it is never claimed again, and healthy rows keep flowing. Delivery of the original messages stays at-least-once.
+
+| Column | Meaning |
+| --- | --- |
+| `id`, `channel`, `affinity_key`, `payload`, `metadata`, `occurred_at` | The original message, unchanged. |
+| `attempts` | Publish attempts made before giving up. |
+| `last_error` | Why it was dead-lettered (truncated to 2000 bytes). |
+| `dead_lettered_at` | When it was moved. |
+
+Inspect it with:
+
+```sql
+SELECT id, channel, attempts, last_error, dead_lettered_at
+FROM outbox_dead_letters
+ORDER BY dead_lettered_at;
+```
+
+#### Replaying dead-lettered messages
+
+After fixing the cause (for example configuring the missing channel), move the rows back to the outbox in one statement:
+
+```sql
+WITH replay AS (
+    DELETE FROM outbox_dead_letters
+    WHERE id = '...'          -- or WHERE channel = '...'
+    RETURNING id, channel, affinity_key, payload, metadata, occurred_at
+)
+INSERT INTO outbox_messages (id, channel, affinity_key, payload, metadata, occurred_at)
+SELECT id, channel, affinity_key, payload, metadata, occurred_at FROM replay;
+```
+
+If the payload itself is wrong, fix it in `outbox_dead_letters` first, or delete the row. A replayed message is delivered at-least-once, may arrive out of order relative to newer messages, and is dead-lettered again if it fails again. Consumers must deduplicate on `Message.ID`.
+
+Dead-lettered rows are kept until you delete them, for example `DELETE FROM outbox_dead_letters WHERE dead_lettered_at < now() - interval '30 days'`.
+
+#### Metrics and alerting
+
+The forwarder logs `outbox message dead-lettered` at error level for every row. The PostgreSQL source also reports metrics through its `Metrics` interface. By default they are structured `outbox metric` log lines; when embedding the source, set `SourceConfig.Metrics` to an implementation that feeds Prometheus, OpenTelemetry or any other system.
+
+| Metric | Meaning |
+| --- | --- |
+| `outbox_dead_lettered_total` | Rows dead-lettered by this forwarder (a counter increment per event). |
+| `dead_lettered` | Rows currently in `outbox_dead_letters`, sampled every 15s. Alert when it is above zero. |
+| `oldest_claimable_age_seconds` | Age of the oldest row that could be claimed now, sampled every 15s. Alert when it keeps growing. |
 
 ### Ordering
 
